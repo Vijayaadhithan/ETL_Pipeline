@@ -11,6 +11,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from rag_ht_pipeline.config import load_config  # noqa: E402
+from rag_ht_pipeline.mysql_loader import mysql_url_from_env  # noqa: E402
 from rag_ht_pipeline.postgres_loader import read_input  # noqa: E402
 from rag_ht_pipeline.source_sync import compare_snapshots  # noqa: E402
 from rag_ht_pipeline.stage3_attributes import clean, dedupe  # noqa: E402
@@ -43,6 +44,18 @@ def test_postgres_loader_reads_parquet() -> None:
     df = read_input(final_file)
     assert len(df) > 0
     assert "embedding_content" in df.columns
+
+
+def test_mysql_url_uses_env_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("MYSQL_HOST", "mysql.example.local")
+    monkeypatch.setenv("MYSQL_PORT", "3307")
+    monkeypatch.setenv("MYSQL_DATABASE", "rag_ht")
+    monkeypatch.setenv("MYSQL_USER", "user name")
+    monkeypatch.setenv("MYSQL_PASSWORD", "pass word")
+
+    url = mysql_url_from_env()
+
+    assert url == "mysql+pymysql://user+name:pass+word@mysql.example.local:3307/rag_ht?charset=utf8mb4"
 
 
 def test_clean_and_dedupe_helpers() -> None:

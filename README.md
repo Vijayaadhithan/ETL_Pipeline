@@ -305,6 +305,49 @@ Schema mismatches from source data are not silently dropped. They are exported t
 output/diagnostics/ad_attribute_schema_mismatches.csv
 ```
 
+## MySQL Loading
+
+If the production database is MySQL/MariaDB, load the final embedding-ready snapshot into MySQL:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
+  --input-file output/final/ads_embedding_ready.parquet \
+  --table ads_embedding_ready \
+  --if-exists replace
+```
+
+Dry run:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
+  --input-file output/final/ads_embedding_ready.parquet \
+  --table ads_embedding_ready \
+  --dry-run
+```
+
+Set credentials in `.env`:
+
+```text
+MYSQL_HOST=testphpmyadmin.gainr.in
+MYSQL_PORT=3306
+MYSQL_DATABASE=hvkbynbu_wwwdevsl_slowr_test
+MYSQL_USER=
+MYSQL_PASSWORD=
+```
+
+Default behavior is `--if-exists replace`. That means the loader creates `ads_embedding_ready` if missing, or rebuilds it if it already exists. This is better than append for this pipeline because `ads_embedding_ready.parquet` is a complete fresh snapshot.
+
+Full rebuild plus MySQL load:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --run-all
+
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
+  --input-file output/final/ads_embedding_ready.parquet \
+  --table ads_embedding_ready \
+  --if-exists replace
+```
+
 ## Postgres Loading
 
 Optional Postgres loader:

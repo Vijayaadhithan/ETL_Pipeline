@@ -152,7 +152,7 @@ PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
 For a scheduled run, use cron or any job runner. Example hourly cron entry:
 
 ```cron
-0 * * * * cd /Users/vjaadhi2799/Downloads/RAG_HT && PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --refresh-source mysql --apply-source-refresh --run-all >> output/reports/cron_pipeline.log 2>&1
+0 * * * * cd /path/to/RAG_HT && PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --refresh-source mysql --apply-source-refresh --run-all >> output/reports/cron_pipeline.log 2>&1
 ```
 
 After every refresh, inspect:

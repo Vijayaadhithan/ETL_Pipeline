@@ -166,6 +166,74 @@ output/reports/final_output_correctness_report.json
 
 `source_table_changes.csv` shows row counts, added rows, removed rows, updated rows, and duplicate primary-key rows per source table. This is the confirmation step before trusting the rebuilt final file.
 
+## Local MySQL End-To-End Test
+
+To test the same workflow against a local/test MySQL database, first put credentials in `.env`:
+
+```text
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_DATABASE=rag_ht_test
+MYSQL_USER=root
+MYSQL_PASSWORD=
+```
+
+Check which CSVs would be uploaded:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_source_loader --dry-run
+```
+
+Create the database if needed and upload the raw source CSVs into MySQL tables:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_source_loader \
+  --create-database \
+  --if-exists replace
+```
+
+The loader creates/replaces these source tables:
+
+```text
+ads
+ads_attributes
+categories
+sub_categories
+attributes
+attribute_values
+states
+location
+locations
+```
+
+Then test that the pipeline can export from MySQL and rebuild:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --refresh-source mysql \
+  --apply-source-refresh \
+  --run-all
+```
+
+Finally, load the completed final file back into MySQL:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
+  --input-file output/final/ads_embedding_ready.parquet \
+  --table ads_embedding_ready \
+  --if-exists replace
+```
+
+Quick SQL checks:
+
+```sql
+SELECT COUNT(*) FROM ads;
+SELECT COUNT(*) FROM ads_embedding_ready;
+SELECT id, title, main_category_name, subcategory_name, city_name, locality_name
+FROM ads_embedding_ready
+LIMIT 10;
+```
+
 ## When New Data Is Added
 
 If source data changes, either export or refresh these CSV files in the project root:
@@ -394,8 +462,4 @@ Do not put usernames or passwords into Python files, YAML config, README, or Git
 .venv/bin/python -m pytest -q
 ```
 
-Current test status:
-
-```text
-14 passed
-```
+The test count can change as checks are added; the command should finish with all tests passing.

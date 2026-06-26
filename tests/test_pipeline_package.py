@@ -12,6 +12,7 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from rag_ht_pipeline.config import load_config  # noqa: E402
 from rag_ht_pipeline.mysql_loader import mysql_url_from_env  # noqa: E402
+from rag_ht_pipeline.mysql_source_loader import load_sources_to_mysql  # noqa: E402
 from rag_ht_pipeline.postgres_loader import read_input  # noqa: E402
 from rag_ht_pipeline.source_sync import compare_snapshots  # noqa: E402
 from rag_ht_pipeline.stage3_attributes import clean, dedupe  # noqa: E402
@@ -56,6 +57,17 @@ def test_mysql_url_uses_env_credentials(monkeypatch) -> None:
     url = mysql_url_from_env()
 
     assert url == "mysql+pymysql://user+name:pass+word@mysql.example.local:3307/rag_ht?charset=utf8mb4"
+
+
+def test_mysql_source_loader_dry_run_reads_configured_csvs() -> None:
+    config = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
+    result = load_sources_to_mysql(config, dry_run=True, sample_size=2)
+
+    assert result["dry_run"] is True
+    assert "ads" in result["tables"]
+    assert "ads_attributes" in result["tables"]
+    if result["tables"]["ads"]["status"] != "missing_csv":
+        assert result["tables"]["ads"]["rows"] <= 2
 
 
 def test_clean_and_dedupe_helpers() -> None:

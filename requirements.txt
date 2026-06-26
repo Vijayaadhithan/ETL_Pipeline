@@ -1,0 +1,8 @@
+pandas
+pyarrow
+pytest
+python-dateutil
+PyYAML
+SQLAlchemy
+psycopg[binary]
+python-dotenv

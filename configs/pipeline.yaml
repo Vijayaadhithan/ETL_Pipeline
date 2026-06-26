@@ -1,0 +1,76 @@
+paths:
+  input_dir: .
+  data_dir: data
+  output_root: output
+  intermediate_dir: output/intermediate
+  final_dir: output/final
+  reports_dir: output/reports
+  diagnostics_dir: output/diagnostics
+
+mysql:
+  host_env: MYSQL_HOST
+  port_env: MYSQL_PORT
+  database: hvkbynbu_wwwdevsl_slowr_test
+  user_env: MYSQL_USER
+  password_env: MYSQL_PASSWORD
+  phpmyadmin_url: https://testphpmyadmin.gainr.in
+  phpmyadmin_database_url: https://testphpmyadmin.gainr.in/index.php?route=/database/structure&db=hvkbynbu_wwwdevsl_slowr_test
+  note: "Use direct DB credentials for automated extraction; phpMyAdmin is a browser UI/reference only."
+
+postgres:
+  host_env: POSTGRES_HOST
+  port_env: POSTGRES_PORT
+  database_env: POSTGRES_DATABASE
+  user_env: POSTGRES_USER
+  password_env: POSTGRES_PASSWORD
+  final_table: ads_embedding_ready
+
+embedding:
+  source_columns:
+    - title
+    - description
+    - meta_title
+    - meta_description
+    - keywords
+    - custom_cat_value
+    - main_category_name
+    - main_category_meta_title
+    - main_category_meta_description
+    - subcategory_name
+    - subcategory_meta_title
+    - subcategory_meta_description
+    - rental_duration
+    - state_name
+    - city_name
+    - locality_name
+    - locality_district
+    - attributes_text
+    - attribute_values_text
+    - attribute_keywords_text
+    - meta_keywords
+    - main_category_meta_keywords
+    - subcategory_meta_keywords
+
+bm25:
+  source_columns:
+    - id
+    - title
+    - keywords
+    - meta_keywords
+    - custom_cat_value
+    - main_category_name
+    - main_category_meta_keywords
+    - main_category_ad_title_label
+    - main_category_placeholder
+    - subcategory_name
+    - subcategory_meta_keywords
+    - rental_duration
+    - main_category_rental_duration
+    - rental_fee
+    - state_name
+    - city_name
+    - locality_name
+    - locality_district
+    - attributes_text
+    - attribute_values_text
+    - attribute_keywords_text

@@ -5,4 +5,5 @@ python-dateutil
 PyYAML
 SQLAlchemy
 psycopg[binary]
+PyMySQL
 python-dotenv

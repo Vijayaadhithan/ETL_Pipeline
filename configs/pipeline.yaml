@@ -7,6 +7,47 @@ paths:
   reports_dir: output/reports
   diagnostics_dir: output/diagnostics
 
+source_sync:
+  staging_dir: output/source_sync/latest
+  backup_dir: output/source_sync/backups
+  tables:
+    - name: ads
+      db_table: ads
+      filename: ads.csv
+      primary_key: id
+    - name: ads_attributes
+      db_table: ads_attributes
+      filename: ads_attributes.csv
+      primary_key: id
+    - name: categories
+      db_table: categories
+      filename: categories.csv
+      primary_key: id
+    - name: sub_categories
+      db_table: sub_categories
+      filename: sub_categories.csv
+      primary_key: id
+    - name: attributes
+      db_table: attributes
+      filename: attributes.csv
+      primary_key: id
+    - name: attribute_values
+      db_table: attribute_values
+      filename: attribute_values.csv
+      primary_key: id
+    - name: states
+      db_table: states
+      filename: states.csv
+      primary_key: id
+    - name: location
+      db_table: location
+      filename: location.csv
+      primary_key: id
+    - name: locations
+      db_table: locations
+      filename: locations.csv
+      primary_key: id
+
 mysql:
   host_env: MYSQL_HOST
   port_env: MYSQL_PORT

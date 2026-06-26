@@ -20,6 +20,12 @@ postgres = [
   "psycopg[binary]",
   "python-dotenv",
 ]
+source-db = [
+  "SQLAlchemy",
+  "psycopg[binary]",
+  "PyMySQL",
+  "python-dotenv",
+]
 dev = [
   "pytest",
 ]

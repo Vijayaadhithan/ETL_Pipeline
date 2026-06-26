@@ -15,7 +15,10 @@ def run_final_verification(
     sample_size: int | None = None,
     max_mismatch_rows: int = 5000,
 ) -> dict[str, Any]:
-    path = config.output.final / "ads_stage_04_embedding_ready.parquet"
+    path = config.output.final / "ads_embedding_ready.parquet"
+    legacy_path = config.output.final / "ads_stage_04_embedding_ready.parquet"
+    if not path.exists() and legacy_path.exists():
+        path = legacy_path
     df = pd.read_parquet(path, columns=["id", "embedding_content"])
     if sample_size is not None:
         df = df.head(sample_size)
@@ -24,6 +27,7 @@ def run_final_verification(
     status = "PASS" if duplicate_rows == 0 and empty_embedding == 0 else "FAIL"
     report = {
         "status": status,
+        "input_file": str(path),
         "rows_checked": int(len(df)),
         "duplicate_ad_id_rows": duplicate_rows,
         "empty_embedding_content_rows": empty_embedding,

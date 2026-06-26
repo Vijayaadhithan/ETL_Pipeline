@@ -37,6 +37,7 @@ src/rag_ht_pipeline/
 Stage modules:
 
 ```text
+source_sync.py             # optional CSV/DB source refresh and change report
 stage1_category.py          # ads category_id -> subcategory -> main category
 stage2_location.py          # city/locality/state enrichment
 stage3_attributes.py        # ads_attributes bridge -> selected ad attributes
@@ -57,6 +58,7 @@ It contains:
 
 - input/output paths
 - MySQL/phpMyAdmin reference metadata
+- source table names, CSV filenames, and primary keys
 - Postgres environment variable names
 - all 23 embedding source columns
 - BM25/filter candidate columns
@@ -96,9 +98,11 @@ Run one stage:
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --stage attributes
 ```
 
-## When New Data Is Added
+## Source Refresh Automation
 
-Current pipeline input is file-based. When the source database changes, export or refresh these CSV files in the project root:
+The pipeline can run from same-name CSV snapshots or from a real database export. The phpMyAdmin URL is only a browser reference; automated refresh should use direct MySQL/MariaDB or Postgres credentials in `.env`.
+
+The configured source tables are:
 
 ```text
 ads.csv
@@ -112,10 +116,85 @@ location.csv
 locations.csv
 ```
 
-Then rerun:
+Check the current local CSV snapshots without changing files:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.source_sync --source csv
+```
+
+Export from MySQL/MariaDB, compare against the current local CSVs, and write a report without replacing files:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.source_sync --source mysql
+```
+
+Export from MySQL/MariaDB and replace the local same-name CSV snapshots after backing up the previous files:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.source_sync --source mysql --apply
+```
+
+Use Postgres as the source instead:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.source_sync --source postgres --apply
+```
+
+Run source refresh, rebuild all stages, and verify the final output in one command:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --refresh-source mysql \
+  --apply-source-refresh \
+  --run-all
+```
+
+For a scheduled run, use cron or any job runner. Example hourly cron entry:
+
+```cron
+0 * * * * cd /Users/vjaadhi2799/Downloads/RAG_HT && PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --refresh-source mysql --apply-source-refresh --run-all >> output/reports/cron_pipeline.log 2>&1
+```
+
+After every refresh, inspect:
+
+```text
+output/reports/source_sync_report.json
+output/reports/source_table_changes.csv
+output/reports/pipeline_run_report.json
+output/reports/final_output_correctness_report.json
+```
+
+`source_table_changes.csv` shows row counts, added rows, removed rows, updated rows, and duplicate primary-key rows per source table. This is the confirmation step before trusting the rebuilt final file.
+
+## When New Data Is Added
+
+If source data changes, either export or refresh these CSV files in the project root:
+
+```text
+ads.csv
+ads_attributes.csv
+categories.csv
+sub_categories.csv
+attributes.csv
+attribute_values.csv
+states.csv
+location.csv
+locations.csv
+```
+
+Manual file workflow:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --run-all
+```
+
+Automated database workflow:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --refresh-source mysql \
+  --apply-source-refresh \
+  --run-all
 ```
 
 The pipeline will rebuild the final files in:
@@ -124,7 +203,7 @@ The pipeline will rebuild the final files in:
 output/final/
 ```
 
-The phpMyAdmin URL in `configs/pipeline.yaml` is only a source database reference. For future automated extraction, use direct MySQL/MariaDB credentials instead of scraping phpMyAdmin.
+The refresh is snapshot-based: the database table is exported as the current source of truth, the old local CSV is backed up, and the enrichment pipeline is rebuilt from the refreshed snapshot. It does not append blindly, because blind append can keep stale or deleted records.
 
 ## Output Layout
 

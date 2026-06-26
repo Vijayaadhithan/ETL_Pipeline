@@ -12,6 +12,7 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from rag_ht_pipeline.config import load_config  # noqa: E402
 from rag_ht_pipeline.postgres_loader import read_input  # noqa: E402
+from rag_ht_pipeline.source_sync import compare_snapshots  # noqa: E402
 from rag_ht_pipeline.stage3_attributes import clean, dedupe  # noqa: E402
 
 
@@ -21,6 +22,8 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "attributes_text" in config.embedding_source_columns
     assert "attribute_values_text" in config.embedding_source_columns
     assert len(config.bm25_source_columns) == 21
+    assert len(config.source_sync["tables"]) == 9
+    assert {table["filename"] for table in config.source_sync["tables"]} >= {"ads.csv", "ads_attributes.csv"}
 
 
 def test_final_embedding_ready_file_is_readable_if_present() -> None:
@@ -46,3 +49,29 @@ def test_clean_and_dedupe_helpers() -> None:
     assert clean("  NULL ") == ""
     assert clean(" hello   world ") == "hello world"
     assert dedupe(["A", "a", "", "B"]) == ["A", "B"]
+
+
+def test_source_sync_detects_added_removed_and_updated_rows() -> None:
+    current = pd.DataFrame(
+        [
+            {"id": "1", "name": "old"},
+            {"id": "2", "name": "same"},
+            {"id": "3", "name": "removed"},
+        ]
+    )
+    incoming = pd.DataFrame(
+        [
+            {"id": "1", "name": "new"},
+            {"id": "2", "name": "same"},
+            {"id": "4", "name": "added"},
+        ]
+    )
+
+    report = compare_snapshots(current, incoming, primary_key="id")
+
+    assert report["added_rows"] == 1
+    assert report["removed_rows"] == 1
+    assert report["updated_rows"] == 1
+    assert report["sample_added_keys"] == ["4"]
+    assert report["sample_removed_keys"] == ["3"]
+    assert report["sample_updated_keys"] == ["1"]

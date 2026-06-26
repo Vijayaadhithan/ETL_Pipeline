@@ -27,6 +27,7 @@ class PipelineConfig:
     output: OutputLayout
     embedding_source_columns: list[str]
     bm25_source_columns: list[str]
+    source_sync: dict[str, Any]
     mysql: dict[str, Any]
     postgres: dict[str, Any]
 
@@ -64,6 +65,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> PipelineConfig:
         output=output,
         embedding_source_columns=list(embedding.get("source_columns", [])),
         bm25_source_columns=list(bm25.get("source_columns", [])),
+        source_sync=dict(raw.get("source_sync", {})),
         mysql=dict(raw.get("mysql", {})),
         postgres=dict(raw.get("postgres", {})),
     )

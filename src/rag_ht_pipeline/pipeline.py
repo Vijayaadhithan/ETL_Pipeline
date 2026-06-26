@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from . import stage1_category, stage2_location, stage3_attributes, stage4_embedding_ready
+from . import source_sync, stage1_category, stage2_location, stage3_attributes, stage4_embedding_ready
 from .artifacts import organize_stage_artifacts, publish_final_aliases
 from .config import DEFAULT_CONFIG_PATH, ensure_output_dirs, load_config
 from .validation import run_final_verification
@@ -28,6 +28,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample-size", type=int, default=None, help="Optional row limit for development runs.")
     parser.add_argument("--no-csv", action="store_true", help="Skip Stage 4 CSV output and write parquet only.")
+    parser.add_argument(
+        "--refresh-source",
+        choices=["csv", "mysql", "postgres"],
+        default=None,
+        help="Run source snapshot inspection/export before enrichment.",
+    )
+    parser.add_argument(
+        "--apply-source-refresh",
+        action="store_true",
+        help="Replace local source CSVs from the database export. Only applies with --refresh-source mysql/postgres.",
+    )
     parser.add_argument(
         "--strict-subcategory-consistency",
         action="store_true",
@@ -55,6 +66,15 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
     stages = STAGE_ORDER if args.run_all or not args.stage else args.stage
     reports: dict[str, Any] = {}
+
+    if args.refresh_source:
+        LOGGER.info("Refreshing source snapshots from: %s", args.refresh_source)
+        reports["source-sync"] = source_sync.run_source_sync(
+            config,
+            source=args.refresh_source,
+            apply=args.apply_source_refresh,
+            sample_size=args.sample_size,
+        )
 
     for stage in stages:
         LOGGER.info("Running stage: %s", stage)

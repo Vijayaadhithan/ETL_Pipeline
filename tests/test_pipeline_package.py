@@ -16,6 +16,7 @@ from rag_ht_pipeline.mysql_source_loader import load_sources_to_mysql  # noqa: E
 from rag_ht_pipeline.postgres_loader import read_input  # noqa: E402
 from rag_ht_pipeline.source_sync import compare_snapshots  # noqa: E402
 from rag_ht_pipeline.stage3_attributes import clean, dedupe  # noqa: E402
+from rag_ht_pipeline.stage5_search_ready import cast_search_ready_types  # noqa: E402
 
 
 def test_config_has_full_embedding_and_bm25_columns() -> None:
@@ -24,6 +25,12 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "attributes_text" in config.embedding_source_columns
     assert "attribute_values_text" in config.embedding_source_columns
     assert len(config.bm25_source_columns) == 21
+    assert len(config.search_ready_columns) == 36
+    assert "embedding_content" in config.search_ready_columns
+    assert "bm25_content" in config.search_ready_columns
+    assert "embedding_source_columns_json" not in config.search_ready_columns
+    assert "embedding_content_char_count" not in config.search_ready_columns
+    assert "embedding_content_token_estimate" not in config.search_ready_columns
     assert len(config.source_sync["tables"]) == 9
     assert {table["filename"] for table in config.source_sync["tables"]} >= {"ads.csv", "ads_attributes.csv"}
 
@@ -57,6 +64,32 @@ def test_mysql_url_uses_env_credentials(monkeypatch) -> None:
     url = mysql_url_from_env()
 
     assert url == "mysql+pymysql://user+name:pass+word@mysql.example.local:3307/rag_ht?charset=utf8mb4"
+
+
+def test_search_ready_type_casts_numeric_and_datetime_columns() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "id": "10",
+                "city_id": "20",
+                "rental_fee": "1500.50",
+                "city_latitude": "13.0827",
+                "created_at": "2026-06-26 10:00:00",
+                "title": "  Sample  ",
+                "embedding_content": "content",
+                "bm25_content": "bm25",
+            }
+        ]
+    )
+
+    typed = cast_search_ready_types(df)
+
+    assert str(typed["id"].dtype) == "Int64"
+    assert str(typed["city_id"].dtype) == "Int64"
+    assert pd.api.types.is_float_dtype(typed["rental_fee"])
+    assert pd.api.types.is_float_dtype(typed["city_latitude"])
+    assert pd.api.types.is_datetime64_any_dtype(typed["created_at"])
+    assert typed.loc[0, "title"] == "Sample"
 
 
 def test_mysql_source_loader_dry_run_reads_configured_csvs() -> None:

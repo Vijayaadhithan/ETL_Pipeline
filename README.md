@@ -2,11 +2,23 @@
 
 This repository builds a verified, embedding-ready rental marketplace dataset from relational CSV exports. The pipeline preserves the source ad rows, enriches IDs into readable category/location/attribute fields, and produces text fields for later semantic search and keyword search.
 
-It does **not** create vector embeddings yet. The current final output is embedding-ready text plus structured metadata.
+It does **not** create vector embeddings yet. The current final output is clean retrieval/search text plus structured metadata.
 
-## Current Final Output
+## Current Final Outputs
 
-Use the parquet file first:
+Use the clean search-ready parquet for MySQL/search:
+
+```text
+output/final/ads_search_ready.parquet
+```
+
+CSV copy:
+
+```text
+output/final/ads_search_ready.csv
+```
+
+The full audit/debug output is also kept locally:
 
 ```text
 output/final/ads_embedding_ready.parquet
@@ -42,6 +54,7 @@ stage1_category.py          # ads category_id -> subcategory -> main category
 stage2_location.py          # city/locality/state enrichment
 stage3_attributes.py        # ads_attributes bridge -> selected ad attributes
 stage4_embedding_ready.py   # embedding_content and bm25_content
+stage5_search_ready.py      # clean retrieval/search table for DB loading
 ```
 
 The split is intentional. These are the main data boundaries. More splitting is only useful later when we add database extraction, vector generation, or retrieval serving.
@@ -219,8 +232,8 @@ Finally, load the completed final file back into MySQL:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
-  --input-file output/final/ads_embedding_ready.parquet \
-  --table ads_embedding_ready \
+  --input-file output/final/ads_search_ready.parquet \
+  --table ads_search_ready \
   --if-exists replace
 ```
 
@@ -228,9 +241,9 @@ Quick SQL checks:
 
 ```sql
 SELECT COUNT(*) FROM ads;
-SELECT COUNT(*) FROM ads_embedding_ready;
+SELECT COUNT(*) FROM ads_search_ready;
 SELECT id, title, main_category_name, subcategory_name, city_name, locality_name
-FROM ads_embedding_ready
+FROM ads_search_ready
 LIMIT 10;
 ```
 
@@ -280,8 +293,8 @@ output/
 ├── final/
 │   ├── ads_embedding_ready.parquet
 │   ├── ads_embedding_ready.csv
-│   ├── ads_stage_04_embedding_ready.parquet
-│   └── ads_stage_04_embedding_ready.csv
+│   ├── ads_search_ready.parquet
+│   └── ads_search_ready.csv
 ├── reports/
 └── diagnostics/
 ```
@@ -291,6 +304,7 @@ Important reports:
 ```text
 output/reports/final_output_correctness_report.json
 output/reports/embedding_ready_report.json
+output/reports/search_ready_report.json
 output/reports/attribute_mapping_report.json
 ```
 
@@ -343,6 +357,34 @@ subcategory_meta_keywords
 
 `bm25_content` keeps keyword/filter-oriented text separate.
 
+## Search-Ready Columns
+
+`ads_search_ready` is the clean table intended for MySQL/search. It keeps only useful retrieval, display, and filter columns plus:
+
+```text
+embedding_content
+bm25_content
+```
+
+It intentionally excludes wide/debug/source columns such as:
+
+```text
+embedding_source_columns_json
+embedding_content_char_count
+embedding_content_token_estimate
+raw_category_id
+raw_city_id
+raw_locality_id
+*_created_at / *_updated_at / *_deleted_at from master tables
+photos
+mobile
+is_mobile_visible
+top_start_date / top_end_date
+premium_start_date / premium_end_date
+```
+
+The full `ads_embedding_ready` file remains available locally for audit and troubleshooting.
+
 ## Attribute Mapping
 
 The confirmed ad-level bridge table is:
@@ -375,12 +417,12 @@ output/diagnostics/ad_attribute_schema_mismatches.csv
 
 ## MySQL Loading
 
-If the production database is MySQL/MariaDB, load the final embedding-ready snapshot into MySQL:
+If the production database is MySQL/MariaDB, load the clean search-ready snapshot into MySQL:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
-  --input-file output/final/ads_embedding_ready.parquet \
-  --table ads_embedding_ready \
+  --input-file output/final/ads_search_ready.parquet \
+  --table ads_search_ready \
   --if-exists replace
 ```
 
@@ -388,8 +430,8 @@ Dry run:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
-  --input-file output/final/ads_embedding_ready.parquet \
-  --table ads_embedding_ready \
+  --input-file output/final/ads_search_ready.parquet \
+  --table ads_search_ready \
   --dry-run
 ```
 
@@ -403,7 +445,7 @@ MYSQL_USER=
 MYSQL_PASSWORD=
 ```
 
-Default behavior is `--if-exists replace`. That means the loader creates `ads_embedding_ready` if missing, or rebuilds it if it already exists. This is better than append for this pipeline because `ads_embedding_ready.parquet` is a complete fresh snapshot.
+Default behavior is `--if-exists replace`. That means the loader creates `ads_search_ready` if missing, or rebuilds it if it already exists. This is better than append for this pipeline because `ads_search_ready.parquet` is a complete fresh snapshot.
 
 Full rebuild plus MySQL load:
 
@@ -411,8 +453,8 @@ Full rebuild plus MySQL load:
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --run-all
 
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
-  --input-file output/final/ads_embedding_ready.parquet \
-  --table ads_embedding_ready \
+  --input-file output/final/ads_search_ready.parquet \
+  --table ads_search_ready \
   --if-exists replace
 ```
 
@@ -422,15 +464,15 @@ Optional Postgres loader:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.postgres_loader \
-  --input-file output/final/ads_embedding_ready.parquet \
-  --table ads_embedding_ready
+  --input-file output/final/ads_search_ready.parquet \
+  --table ads_search_ready
 ```
 
 Dry run:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.postgres_loader \
-  --input-file output/final/ads_embedding_ready.parquet \
+  --input-file output/final/ads_search_ready.parquet \
   --dry-run
 ```
 

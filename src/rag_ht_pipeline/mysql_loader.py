@@ -12,9 +12,9 @@ from .postgres_loader import load_env_file, read_input
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load the embedding-ready file into MySQL/MariaDB.")
-    parser.add_argument("--input-file", type=Path, default=Path("output/final/ads_embedding_ready.parquet"))
-    parser.add_argument("--table", default="ads_embedding_ready")
+    parser = argparse.ArgumentParser(description="Load the clean search-ready file into MySQL/MariaDB.")
+    parser.add_argument("--input-file", type=Path, default=Path("output/final/ads_search_ready.parquet"))
+    parser.add_argument("--table", default="ads_search_ready")
     parser.add_argument("--if-exists", choices=["fail", "replace", "append"], default="replace")
     parser.add_argument("--chunksize", type=int, default=2000)
     parser.add_argument("--dry-run", action="store_true", help="Validate config and input without writing.")
@@ -37,7 +37,7 @@ def mysql_url_from_env() -> str:
 
 def mysql_dtype_map(df: pd.DataFrame) -> dict[str, Any]:
     try:
-        from sqlalchemy.dialects.mysql import BIGINT, DOUBLE, LONGTEXT
+        from sqlalchemy.dialects.mysql import BIGINT, DATETIME, DOUBLE, LONGTEXT
     except ModuleNotFoundError as exc:
         raise RuntimeError("SQLAlchemy and PyMySQL are required for MySQL loading. Install requirements.txt first.") from exc
 
@@ -47,6 +47,8 @@ def mysql_dtype_map(df: pd.DataFrame) -> dict[str, Any]:
             dtype[column] = BIGINT()
         elif pd.api.types.is_float_dtype(pandas_dtype):
             dtype[column] = DOUBLE()
+        elif pd.api.types.is_datetime64_any_dtype(pandas_dtype):
+            dtype[column] = DATETIME()
         else:
             dtype[column] = LONGTEXT(charset="utf8mb4", collation="utf8mb4_unicode_ci")
     return dtype

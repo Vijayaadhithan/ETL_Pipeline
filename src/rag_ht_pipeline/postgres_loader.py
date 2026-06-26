@@ -9,9 +9,9 @@ import pandas as pd
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load the embedding-ready file into PostgreSQL.")
-    parser.add_argument("--input-file", type=Path, default=Path("output/final/ads_embedding_ready.parquet"))
-    parser.add_argument("--table", default="ads_embedding_ready")
+    parser = argparse.ArgumentParser(description="Load the clean search-ready file into PostgreSQL.")
+    parser.add_argument("--input-file", type=Path, default=Path("output/final/ads_search_ready.parquet"))
+    parser.add_argument("--table", default="ads_search_ready")
     parser.add_argument("--schema", default="public")
     parser.add_argument("--if-exists", choices=["fail", "replace", "append"], default="replace")
     parser.add_argument("--chunksize", type=int, default=5000)

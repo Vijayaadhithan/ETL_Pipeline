@@ -6,14 +6,21 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from . import source_sync, stage1_category, stage2_location, stage3_attributes, stage4_embedding_ready
+from . import (
+    source_sync,
+    stage1_category,
+    stage2_location,
+    stage3_attributes,
+    stage4_embedding_ready,
+    stage5_search_ready,
+)
 from .artifacts import organize_stage_artifacts, publish_final_aliases
 from .config import DEFAULT_CONFIG_PATH, ensure_output_dirs, load_config
 from .validation import run_final_verification
 
 
 LOGGER = logging.getLogger("rag_ht_pipeline")
-STAGE_ORDER = ["category", "location", "attributes", "embedding-ready", "validate"]
+STAGE_ORDER = ["category", "location", "attributes", "embedding-ready", "search-ready", "validate"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,6 +98,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         elif stage == "embedding-ready":
             reports[stage] = stage4_embedding_ready.run(config, sample_size=args.sample_size, no_csv=args.no_csv)
             publish_final_aliases(config)
+        elif stage == "search-ready":
+            reports[stage] = stage5_search_ready.run(config, sample_size=args.sample_size, no_csv=args.no_csv)
         elif stage == "validate":
             reports[stage] = run_final_verification(config, sample_size=args.sample_size)
         organize_stage_artifacts(config)

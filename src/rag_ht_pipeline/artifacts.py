@@ -14,6 +14,7 @@ REPORT_FILES = {
     "attribute_mapping_report.json",
     "attribute_mapping_report.md",
     "embedding_ready_report.json",
+    "search_ready_report.json",
     "final_output_correctness_report.json",
     "final_output_correctness_report.md",
 }

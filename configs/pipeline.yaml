@@ -64,7 +64,46 @@ postgres:
   database_env: POSTGRES_DATABASE
   user_env: POSTGRES_USER
   password_env: POSTGRES_PASSWORD
-  final_table: ads_embedding_ready
+  final_table: ads_search_ready
+
+search_ready:
+  columns:
+    - id
+    - title
+    - description
+    - rental_duration
+    - rental_fee
+    - status
+    - created_at
+    - updated_at
+    - main_category_id
+    - main_category_name
+    - subcategory_id
+    - subcategory_name
+    - state_id
+    - state_name
+    - city_id
+    - city_name
+    - locality_id
+    - locality_name
+    - locality_district
+    - locality_pincode
+    - city_latitude
+    - city_longitude
+    - locality_latitude
+    - locality_longitude
+    - attributes_text
+    - attribute_values_text
+    - attribute_keywords_text
+    - attributes_json
+    - attribute_ids_json
+    - attribute_value_ids_json
+    - category_join_status
+    - location_join_status
+    - attribute_mapping_status
+    - city_locality_consistency_status
+    - embedding_content
+    - bm25_content
 
 embedding:
   source_columns:

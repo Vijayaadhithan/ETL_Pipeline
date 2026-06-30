@@ -603,6 +603,60 @@ def test_postgres_source_uses_profile_credentials_and_qualified_table(
     assert qualified == '"inventory"."inventory_items"'
 
 
+def test_streaming_validation_detects_duplicates_across_batches(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_root = tmp_path / "output" / "acme"
+    companies = _write_flat_profile(tmp_path, "acme", output_root)
+    config = load_company_config("acme", companies_dir=companies)
+    config.output.final.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "company_id": "acme",
+                "id": "P-1",
+                "title": "One",
+                "description": "",
+                "embedding_content": "One",
+                "bm25_content": "One",
+                "extras_json": "{}",
+            },
+            {
+                "company_id": "acme",
+                "id": "P-2",
+                "title": "Two",
+                "description": "",
+                "embedding_content": "Two",
+                "bm25_content": "Two",
+                "extras_json": "{}",
+            },
+            {
+                "company_id": "acme",
+                "id": "P-1",
+                "title": "Duplicate",
+                "description": "",
+                "embedding_content": "Duplicate",
+                "bm25_content": "Duplicate",
+                "extras_json": "{}",
+            },
+        ]
+    ).to_parquet(
+        config.output.final / "catalog_search_ready.parquet",
+        index=False,
+    )
+    monkeypatch.setattr(
+        "rag_ht_pipeline.validation.VALIDATION_BATCH_SIZE",
+        2,
+    )
+
+    report = run_final_verification(config)
+
+    assert report["status"] == "FAIL"
+    assert report["rows_checked"] == 3
+    assert report["duplicate_ad_id_rows"] == 2
+
+
 def test_flat_catalog_adapter_emits_canonical_isolated_artifacts(tmp_path: Path) -> None:
     data_dir = tmp_path / "data" / "acme"
     data_dir.mkdir(parents=True)

@@ -283,6 +283,15 @@ PYTHONUNBUFFERED=1 .venv/bin/rag-ht-pipeline \
   --no-csv
 ```
 
+If the log shows `search-ready` completed and only `validate` failed, run:
+
+```bash
+PYTHONUNBUFFERED=1 .venv/bin/rag-ht-pipeline \
+  --company gainr \
+  --stage validate \
+  --no-csv
+```
+
 ## Outputs and Reports
 
 Authoritative Gainr output:

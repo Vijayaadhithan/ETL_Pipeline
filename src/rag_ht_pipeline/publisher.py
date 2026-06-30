@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import quote_plus
 from uuid import uuid4
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from .config import PipelineConfig
 from .credentials import resolve_env_value
@@ -28,6 +30,7 @@ CANONICAL_REQUIRED = {
     "extras_json",
 }
 LOGGER = logging.getLogger("rag_ht_pipeline.publisher")
+PUBLISH_BATCH_SIZE = 25_000
 
 
 def safe_identifier(value: str, label: str) -> str:
@@ -109,6 +112,57 @@ def validate_publish_frame(config: PipelineConfig, df: pd.DataFrame) -> dict[str
     }
 
 
+def iter_parquet_frames(
+    path: Path,
+    *,
+    columns: list[str] | None = None,
+    batch_size: int = PUBLISH_BATCH_SIZE,
+) -> Iterator[pd.DataFrame]:
+    source = pq.ParquetFile(path)
+    for batch in source.iter_batches(batch_size=batch_size, columns=columns):
+        yield batch.to_pandas()
+
+
+def validate_publish_file(config: PipelineConfig, path: Path) -> dict[str, Any]:
+    schema = pq.read_schema(path)
+    missing = sorted(CANONICAL_REQUIRED - set(schema.names))
+    if missing:
+        raise ValueError(f"Cannot publish; canonical columns are missing: {missing}")
+
+    id_counts: Counter[Any] = Counter()
+    rows = 0
+    wrong_company = 0
+    empty_embedding = 0
+    empty_bm25 = 0
+    required_columns = sorted(CANONICAL_REQUIRED)
+    for frame in iter_parquet_frames(path, columns=required_columns):
+        rows += len(frame)
+        id_counts.update(
+            None if pd.isna(value) else value.item() if hasattr(value, "item") else value
+            for value in frame["id"]
+        )
+        wrong_company += int(frame["company_id"].map(clean).ne(config.company_id).sum())
+        empty_embedding += int(frame["embedding_content"].map(clean).eq("").sum())
+        empty_bm25 += int(frame["bm25_content"].map(clean).eq("").sum())
+    if rows == 0:
+        raise ValueError("Cannot publish an empty search-ready artifact.")
+    duplicate_ids = sum(count for count in id_counts.values() if count > 1)
+    if duplicate_ids or wrong_company or empty_embedding or empty_bm25:
+        raise ValueError(
+            "Cannot publish invalid data: "
+            f"duplicate_ids={duplicate_ids}, wrong_company={wrong_company}, "
+            f"empty_embedding={empty_embedding}, empty_bm25={empty_bm25}"
+        )
+    return {
+        "rows": rows,
+        "columns": len(schema.names),
+        "duplicate_ids": duplicate_ids,
+        "wrong_company_rows": wrong_company,
+        "empty_embedding_rows": empty_embedding,
+        "empty_bm25_rows": empty_bm25,
+    }
+
+
 def _mysql_publish(connection: Any, df: pd.DataFrame, table: str, staging: str, backup: str) -> None:
     from sqlalchemy import inspect, text
 
@@ -164,12 +218,102 @@ def _postgres_publish(
         connection.execute(text(f'ALTER TABLE "{schema}"."{staging}" RENAME TO "{table}"'))
 
 
+def _mysql_publish_file(
+    connection: Any,
+    input_path: Path,
+    *,
+    expected_rows: int,
+    table: str,
+    staging: str,
+    backup: str,
+) -> None:
+    from sqlalchemy import inspect, text
+
+    rows_written = 0
+    for batch_number, frame in enumerate(iter_parquet_frames(input_path), start=1):
+        frame.to_sql(
+            staging,
+            connection,
+            if_exists="fail" if batch_number == 1 else "append",
+            index=False,
+            chunksize=2000,
+            method="multi",
+            dtype=mysql_dtype_map(frame) if batch_number == 1 else None,
+        )
+        rows_written += len(frame)
+        LOGGER.info(
+            "MySQL publish batch %s complete: rows=%s total=%s",
+            batch_number,
+            len(frame),
+            rows_written,
+        )
+    if rows_written != expected_rows:
+        raise RuntimeError(
+            f"Staging write mismatch: expected {expected_rows}, wrote {rows_written}"
+        )
+    loaded = connection.execute(text(f"SELECT COUNT(*) FROM `{staging}`")).scalar_one()
+    if loaded != expected_rows:
+        raise RuntimeError(f"Staging row-count mismatch: expected {expected_rows}, loaded {loaded}")
+    if inspect(connection).has_table(table):
+        connection.execute(text(f"RENAME TABLE `{table}` TO `{backup}`, `{staging}` TO `{table}`"))
+        try:
+            connection.execute(text(f"DROP TABLE `{backup}`"))
+        except Exception:
+            LOGGER.warning("Published %s but could not remove backup table %s", table, backup, exc_info=True)
+    else:
+        connection.execute(text(f"RENAME TABLE `{staging}` TO `{table}`"))
+
+
+def _postgres_publish_file(
+    connection: Any,
+    input_path: Path,
+    *,
+    expected_rows: int,
+    table: str,
+    staging: str,
+    backup: str,
+    schema: str,
+) -> None:
+    from sqlalchemy import inspect, text
+
+    rows_written = 0
+    for batch_number, frame in enumerate(iter_parquet_frames(input_path), start=1):
+        frame.to_sql(
+            staging,
+            connection,
+            schema=schema,
+            if_exists="fail" if batch_number == 1 else "append",
+            index=False,
+            chunksize=5000,
+            method="multi",
+        )
+        rows_written += len(frame)
+        LOGGER.info(
+            "PostgreSQL publish batch %s complete: rows=%s total=%s",
+            batch_number,
+            len(frame),
+            rows_written,
+        )
+    if rows_written != expected_rows:
+        raise RuntimeError(
+            f"Staging write mismatch: expected {expected_rows}, wrote {rows_written}"
+        )
+    loaded = connection.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{staging}"')).scalar_one()
+    if loaded != expected_rows:
+        raise RuntimeError(f"Staging row-count mismatch: expected {expected_rows}, loaded {loaded}")
+    if inspect(connection).has_table(table, schema=schema):
+        connection.execute(text(f'ALTER TABLE "{schema}"."{table}" RENAME TO "{backup}"'))
+        connection.execute(text(f'ALTER TABLE "{schema}"."{staging}" RENAME TO "{table}"'))
+        connection.execute(text(f'DROP TABLE "{schema}"."{backup}"'))
+    else:
+        connection.execute(text(f'ALTER TABLE "{schema}"."{staging}" RENAME TO "{table}"'))
+
+
 def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[str, Any]:
     input_path = config.output.final / f"{config.artifact_prefix}_search_ready.parquet"
     if not input_path.exists():
         raise FileNotFoundError(f"Missing validated search-ready artifact: {input_path}")
-    df = pd.read_parquet(input_path)
-    validation = validate_publish_frame(config, df)
+    validation = validate_publish_file(config, input_path)
     table = safe_identifier(str(config.destination.get("table", "search_ready")), "destination table")
     schema = safe_identifier(str(config.destination.get("schema", "public")), "destination schema")
     report: dict[str, Any] = {
@@ -182,6 +326,7 @@ def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[st
         "validation": validation,
         "published": False,
         "published_at": "",
+        "batch_size": PUBLISH_BATCH_SIZE,
     }
     backend, url = destination_url(config)
     if dry_run:
@@ -199,9 +344,24 @@ def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[st
     try:
         with engine.begin() as connection:
             if backend == "mysql":
-                _mysql_publish(connection, df, table, staging, backup)
+                _mysql_publish_file(
+                    connection,
+                    input_path,
+                    expected_rows=validation["rows"],
+                    table=table,
+                    staging=staging,
+                    backup=backup,
+                )
             else:
-                _postgres_publish(connection, df, table, staging, backup, schema)
+                _postgres_publish_file(
+                    connection,
+                    input_path,
+                    expected_rows=validation["rows"],
+                    table=table,
+                    staging=staging,
+                    backup=backup,
+                    schema=schema,
+                )
     except Exception:
         try:
             from sqlalchemy import text

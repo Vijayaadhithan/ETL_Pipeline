@@ -47,37 +47,32 @@ class GainrAdapter(CompanyAdapter):
             raise ValueError(f"Gainr source schema is missing required columns: {missing}")
         return {"adapter": self.name, "files": files, "status": "valid"}
 
-    @staticmethod
-    def _add_canonical_fields(config: PipelineConfig) -> None:
-        path = config.output.intermediate / f"{config.artifact_prefix}_stage_03_attributes_enriched.parquet"
-        df = pd.read_parquet(path)
-        df["company_id"] = config.company_id
-        if "extras_json" not in df.columns:
-            df["extras_json"] = "{}"
-        df.to_parquet(path, index=False)
-        csv_path = path.with_suffix(".csv")
-        if csv_path.exists():
-            df.to_csv(csv_path, index=False)
-
     def normalize(
         self,
         config: PipelineConfig,
         *,
         sample_size: int | None = None,
         strict_subcategory_consistency: bool = False,
+        no_csv: bool = False,
+        record_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         source_validation = self.validate_sources(config)
         reports = {
             "source-validation": source_validation,
-            "category": stage1_category.run(config, sample_size=sample_size),
-            "location": stage2_location.run(config, sample_size=sample_size),
+            "category": stage1_category.run(
+                config,
+                sample_size=sample_size,
+                no_csv=no_csv,
+                record_ids=record_ids,
+            ),
+            "location": stage2_location.run(config, sample_size=sample_size, no_csv=no_csv),
             "attributes": stage3_attributes.run(
                 config,
                 sample_size=sample_size,
                 strict_subcategory_consistency=strict_subcategory_consistency,
+                no_csv=no_csv,
             ),
         }
-        self._add_canonical_fields(config)
         return reports
 
     def run_legacy_stage(
@@ -87,17 +82,23 @@ class GainrAdapter(CompanyAdapter):
         *,
         sample_size: int | None = None,
         strict_subcategory_consistency: bool = False,
+        no_csv: bool = False,
+        record_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         if stage == "category":
-            return stage1_category.run(config, sample_size=sample_size)
+            return stage1_category.run(
+                config,
+                sample_size=sample_size,
+                no_csv=no_csv,
+                record_ids=record_ids,
+            )
         if stage == "location":
-            return stage2_location.run(config, sample_size=sample_size)
+            return stage2_location.run(config, sample_size=sample_size, no_csv=no_csv)
         if stage == "attributes":
-            report = stage3_attributes.run(
+            return stage3_attributes.run(
                 config,
                 sample_size=sample_size,
                 strict_subcategory_consistency=strict_subcategory_consistency,
+                no_csv=no_csv,
             )
-            self._add_canonical_fields(config)
-            return report
         raise ValueError(f"Unknown Gainr legacy stage: {stage}")

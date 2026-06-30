@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from . import source_sync, stage4_embedding_ready, stage5_search_ready
@@ -19,7 +20,17 @@ from .config import (
     load_company_config,
     load_config,
 )
+from .incremental import (
+    archive_incremental_reports,
+    cleanup_incremental_work,
+    commit_merged_artifacts,
+    incremental_work_config,
+    load_change_set,
+    missing_incremental_baselines,
+    prepare_merged_artifacts,
+)
 from .publisher import credential_value, publish_company
+from .publisher import validate_publish_file
 from .validation import run_final_verification
 
 
@@ -49,7 +60,16 @@ def parse_args() -> argparse.Namespace:
         help="Run one or more specific stages. Legacy stages are supported by the Gainr adapter.",
     )
     parser.add_argument("--sample-size", type=int, default=None, help="Optional row limit for development runs.")
-    parser.add_argument("--no-csv", action="store_true", help="Write parquet final artifacts without CSV copies.")
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="Use Parquet-only intermediate/final artifacts and skip CSV copies.",
+    )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="After an applied source refresh, transform and merge only changed records.",
+    )
     parser.add_argument(
         "--refresh-source",
         choices=["configured", "csv", "mysql", "postgres"],
@@ -82,6 +102,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("--config cannot be combined with --all-companies.")
     if args.config and args.company:
         parser.error("--config cannot be combined with --company.")
+    if args.incremental:
+        if not args.run_all or args.stage:
+            parser.error("--incremental requires --run-all and cannot be combined with --stage.")
+        if not args.refresh_source or not args.apply_source_refresh:
+            parser.error(
+                "--incremental requires --refresh-source and --apply-source-refresh."
+            )
+        if args.sample_size is not None:
+            parser.error("--incremental cannot be combined with --sample-size.")
+        if not args.no_csv:
+            parser.error("--incremental requires --no-csv to avoid stale full CSV copies.")
     return args
 
 
@@ -107,6 +138,94 @@ def _profile_env_file(config: PipelineConfig) -> Path:
     return path if path.is_absolute() else config.project_root / path
 
 
+def run_incremental_update(
+    config: PipelineConfig,
+    adapter: Any,
+    change_set: dict[str, Any],
+    *,
+    strict_subcategory_consistency: bool,
+) -> dict[str, Any]:
+    changed_ids = {str(value) for value in change_set["changed_ids"]}
+    removed_ids = {str(value) for value in change_set["removed_ids"]}
+    work_config, run_id = incremental_work_config(config)
+    reports: dict[str, Any] = {
+        "mode": "incremental",
+        "run_id": run_id,
+        "changed_id_count": len(changed_ids),
+        "removed_id_count": len(removed_ids),
+        "changed_ids": sorted(changed_ids),
+        "removed_ids": sorted(removed_ids),
+    }
+    committed = False
+    try:
+        if changed_ids:
+            stage_started = perf_counter()
+            reports["normalize"] = adapter.normalize(
+                work_config,
+                strict_subcategory_consistency=strict_subcategory_consistency,
+                no_csv=True,
+                record_ids=changed_ids,
+            )
+            LOGGER.info(
+                "[%s] incremental normalize completed in %.2fs",
+                config.company_id,
+                perf_counter() - stage_started,
+            )
+            stage_started = perf_counter()
+            reports["embedding-ready"] = stage4_embedding_ready.run(
+                work_config,
+                no_csv=True,
+            )
+            LOGGER.info(
+                "[%s] incremental embedding-ready completed in %.2fs",
+                config.company_id,
+                perf_counter() - stage_started,
+            )
+            stage_started = perf_counter()
+            reports["search-ready"] = stage5_search_ready.run(
+                work_config,
+                no_csv=True,
+            )
+            LOGGER.info(
+                "[%s] incremental search-ready completed in %.2fs",
+                config.company_id,
+                perf_counter() - stage_started,
+            )
+
+        prepared, artifact_reports = prepare_merged_artifacts(
+            config,
+            work_config,
+            removed_ids=removed_ids,
+        )
+        reports["artifacts"] = artifact_reports
+        prepared_search = next(
+            (
+                prepared_path
+                for prepared_path, destination in prepared
+                if destination.name
+                == f"{config.artifact_prefix}_search_ready.parquet"
+            ),
+            None,
+        )
+        if prepared_search is None:
+            raise RuntimeError("Incremental merge did not prepare a search-ready artifact.")
+        reports["pre_commit_validation"] = validate_publish_file(
+            config,
+            prepared_search,
+        )
+        reports["archive"] = str(
+            archive_incremental_reports(config, work_config, run_id)
+        )
+        commit_merged_artifacts(prepared, config)
+        committed = True
+    finally:
+        if committed:
+            cleanup_incremental_work(work_config)
+        else:
+            reports["preserved_work_dir"] = str(work_config.output.root)
+    return reports
+
+
 def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> dict[str, Any]:
     ensure_output_dirs(config)
     adapter = get_adapter(config.adapter)
@@ -114,6 +233,7 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
     stages = [] if publish_only else (SHARED_STAGE_ORDER if args.run_all or not args.stage else args.stage)
     reports: dict[str, Any] = {}
 
+    source_sync_report: dict[str, Any] | None = None
     if args.refresh_source:
         resolved_source = source_sync.resolve_source_backend(config, args.refresh_source)
         LOGGER.info(
@@ -121,21 +241,69 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
             config.company_id,
             resolved_source,
         )
-        reports["source-sync"] = source_sync.run_source_sync(
+        source_sync_report = source_sync.run_source_sync(
             config,
             source=resolved_source,
             apply=args.apply_source_refresh,
             env_file=_profile_env_file(config),
             sample_size=args.sample_size,
         )
+        reports["source-sync"] = source_sync_report
+
+    if args.incremental:
+        if source_sync_report is None:
+            raise RuntimeError("Incremental execution requires a source refresh report.")
+        change_set_path = Path(
+            source_sync_report.get("incremental", {}).get("change_set_path", "")
+        )
+        change_set = load_change_set(change_set_path)
+        if change_set["company_id"] != config.company_id:
+            raise ValueError(
+                f"Incremental change set belongs to {change_set['company_id']!r}, "
+                f"not {config.company_id!r}."
+            )
+        missing_baselines = missing_incremental_baselines(config)
+        source_mode = change_set["mode"]
+        if source_mode == "incremental" and not missing_baselines:
+            reports["incremental"] = run_incremental_update(
+                config,
+                adapter,
+                change_set,
+                strict_subcategory_consistency=args.strict_subcategory_consistency,
+            )
+            stages = ["validate"]
+        elif source_mode == "no_changes" and not missing_baselines:
+            reports["incremental"] = {
+                "mode": "no_changes",
+                "reason": change_set["reason"],
+                "changed_id_count": 0,
+                "removed_id_count": 0,
+            }
+            stages = ["validate"]
+        else:
+            reason = change_set["reason"]
+            if missing_baselines:
+                reason = (
+                    "A full rebuild is required because baseline artifacts are missing: "
+                    + ", ".join(str(path) for path in missing_baselines)
+                )
+            reports["incremental"] = {
+                "mode": "full_fallback",
+                "source_mode": source_mode,
+                "reason": reason,
+                "invalidating_tables": change_set.get("invalidating_tables", []),
+            }
+            LOGGER.info("[%s] incremental fallback: %s", config.company_id, reason)
 
     for stage in stages:
         LOGGER.info("[%s] running stage: %s", config.company_id, stage)
+        stage_started = perf_counter()
         if stage == "normalize":
             reports[stage] = adapter.normalize(
                 config,
                 sample_size=args.sample_size,
                 strict_subcategory_consistency=args.strict_subcategory_consistency,
+                no_csv=args.no_csv,
             )
         elif stage in LEGACY_STAGES:
             reports[stage] = adapter.run_legacy_stage(
@@ -143,6 +311,7 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
                 config,
                 sample_size=args.sample_size,
                 strict_subcategory_consistency=args.strict_subcategory_consistency,
+                no_csv=args.no_csv,
             )
         elif stage == "embedding-ready":
             reports[stage] = stage4_embedding_ready.run(
@@ -162,6 +331,12 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
             if reports[stage]["status"] != "PASS":
                 raise RuntimeError(f"Final validation failed for company {config.company_id!r}.")
         organize_stage_artifacts(config)
+        LOGGER.info(
+            "[%s] completed stage %s in %.2fs",
+            config.company_id,
+            stage,
+            perf_counter() - stage_started,
+        )
 
     if args.publish or args.publish_dry_run:
         validation = reports.get("validate") or run_final_verification(config, sample_size=args.sample_size)
@@ -172,6 +347,17 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
 
     publish_final_aliases(config)
     organize_stage_artifacts(config)
+    if args.incremental and "incremental" in reports:
+        incremental_report = config.output.reports / "incremental_run_report.json"
+        incremental_report.write_text(
+            json.dumps(
+                reports["incremental"],
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
     write_pipeline_report(config, reports)
     return reports
 

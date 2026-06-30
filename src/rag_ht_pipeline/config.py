@@ -42,6 +42,7 @@ class PipelineConfig:
     destination: dict[str, Any]
     credentials: dict[str, Any]
     adapter_config: dict[str, Any]
+    incremental: dict[str, Any]
     filter_columns: list[str]
     search_ready_types: dict[str, list[str]]
     config_path: Path
@@ -146,6 +147,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> PipelineConfig:
         destination=dict(raw.get("destination", {})),
         credentials=dict(raw.get("credentials", {})),
         adapter_config=dict(raw.get("adapter_config", {})),
+        incremental=dict(raw.get("incremental", {})),
         filter_columns=filter_columns,
         search_ready_types={
             key: list(value)

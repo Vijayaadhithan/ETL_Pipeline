@@ -63,8 +63,25 @@ def compare_snapshots(
     primary_key: str,
     sample_limit: int = 20,
 ) -> dict[str, Any]:
+    report, _ = compare_snapshot_changes(
+        current,
+        incoming,
+        primary_key=primary_key,
+        sample_limit=sample_limit,
+    )
+    return report
+
+
+def compare_snapshot_changes(
+    current: pd.DataFrame | None,
+    incoming: pd.DataFrame,
+    *,
+    primary_key: str,
+    sample_limit: int = 20,
+) -> tuple[dict[str, Any], dict[str, set[str]]]:
     current_rows = 0 if current is None else len(current)
     incoming_rows = len(incoming)
+    changes = {"added": set(), "removed": set(), "updated": set()}
     report: dict[str, Any] = {
         "current_rows": int(current_rows),
         "incoming_rows": int(incoming_rows),
@@ -82,9 +99,14 @@ def compare_snapshots(
     }
     if current is None:
         report["added_rows"] = int(incoming_rows)
-        return report
+        if primary_key in incoming.columns:
+            changes["added"] = {
+                key for key in incoming[primary_key].map(clean_key) if key
+            }
+            report["sample_added_keys"] = sorted(changes["added"])[:sample_limit]
+        return report, changes
     if primary_key not in incoming.columns or primary_key not in current.columns:
-        return report
+        return report, changes
 
     current_work = current.copy()
     incoming_work = incoming.copy()
@@ -112,6 +134,11 @@ def compare_snapshots(
     current_hash = row_hashes(current_indexed.loc[common], common_columns)
     incoming_hash = row_hashes(incoming_indexed.loc[common], common_columns)
     updated = [key for key, old_hash, new_hash in zip(common, current_hash, incoming_hash, strict=False) if old_hash != new_hash]
+    changes = {
+        "added": set(added),
+        "removed": set(removed),
+        "updated": set(updated),
+    }
 
     report.update(
         {
@@ -123,7 +150,23 @@ def compare_snapshots(
             "sample_updated_keys": updated[:sample_limit],
         }
     )
-    return report
+    return report, changes
+
+
+def related_record_ids(
+    frame: pd.DataFrame | None,
+    *,
+    primary_key: str,
+    row_keys: set[str],
+    record_key: str,
+) -> set[str]:
+    if frame is None or not row_keys:
+        return set()
+    if primary_key not in frame.columns or record_key not in frame.columns:
+        return set()
+    normalized_keys = frame[primary_key].map(clean_key)
+    values = frame.loc[normalized_keys.isin(row_keys), record_key].map(clean_key)
+    return {value for value in values if value}
 
 
 def source_tables(config: PipelineConfig) -> list[dict[str, str]]:
@@ -301,8 +344,47 @@ def export_database_tables(
     return exported
 
 
-def backup_and_apply(config: PipelineConfig, exported: dict[str, Path], backup_dir: Path) -> list[dict[str, str]]:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+def prune_backup_runs(
+    backup_dir: Path,
+    *,
+    current_backup: Path,
+    retention: int,
+) -> list[str]:
+    if retention < 1:
+        raise ValueError("source_sync.backup_retention must be at least 1.")
+    if not current_backup.exists():
+        return []
+    runs = sorted(
+        (
+            path
+            for path in backup_dir.iterdir()
+            if path.is_dir() and not path.is_symlink()
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    keep = {current_backup}
+    for path in runs:
+        if len(keep) >= retention:
+            break
+        keep.add(path)
+    removed: list[str] = []
+    for path in runs:
+        if path in keep:
+            continue
+        shutil.rmtree(path)
+        removed.append(str(path))
+    return removed
+
+
+def backup_and_apply(
+    config: PipelineConfig,
+    exported: dict[str, Path],
+    backup_dir: Path,
+    *,
+    retention: int = 1,
+) -> tuple[list[dict[str, str]], list[str]]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_root = backup_dir / timestamp
     actions: list[dict[str, str]] = []
     for filename, incoming_path in exported.items():
@@ -322,7 +404,12 @@ def backup_and_apply(config: PipelineConfig, exported: dict[str, Path], backup_d
                 "backup": str(backup_path) if str(backup_path) else "",
             }
         )
-    return actions
+    pruned = prune_backup_runs(
+        backup_dir,
+        current_backup=backup_root,
+        retention=retention,
+    )
+    return actions, pruned
 
 
 def write_reports(config: PipelineConfig, report: dict[str, Any]) -> None:
@@ -350,6 +437,42 @@ def write_reports(config: PipelineConfig, report: dict[str, Any]) -> None:
             }
         )
     pd.DataFrame(rows).to_csv(config.output.reports / "source_table_changes.csv", index=False)
+
+
+def write_incremental_change_set(
+    config: PipelineConfig,
+    *,
+    source: str,
+    applied: bool,
+    mode: str,
+    changed_ids: set[str],
+    removed_ids: set[str],
+    invalidating_tables: list[str],
+    reason: str,
+) -> tuple[Path, dict[str, Any]]:
+    path = config.output.reports / "incremental_change_set.json"
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "company_id": config.company_id,
+        "source": source,
+        "applied": applied,
+        "mode": mode,
+        "reason": reason,
+        "changed_ids": sorted(changed_ids),
+        "removed_ids": sorted(removed_ids),
+        "changed_id_count": len(changed_ids),
+        "removed_id_count": len(removed_ids),
+        "invalidating_tables": invalidating_tables,
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path, {
+        key: value
+        for key, value in payload.items()
+        if key not in {"changed_ids", "removed_ids"}
+    } | {"change_set_path": str(path)}
 
 
 def run_source_sync(
@@ -384,7 +507,23 @@ def run_source_sync(
         "staging_dir": str(staging_dir),
         "tables": {},
         "apply_actions": [],
+        "backup_retention": int(config.source_sync.get("backup_retention", 1)),
+        "pruned_backup_directories": [],
     }
+    incremental = config.incremental
+    record_table = str(incremental.get("record_table", "")).strip()
+    record_key = str(incremental.get("record_key", "id")).strip()
+    dependent_tables = {
+        str(table): str(parent_key)
+        for table, parent_key in dict(incremental.get("dependent_tables", {})).items()
+    }
+    full_rebuild_tables = {
+        str(table) for table in incremental.get("full_rebuild_tables", [])
+    }
+    changed_ids: set[str] = set()
+    removed_ids: set[str] = set()
+    invalidating_tables: set[str] = set()
+    missing_previous_snapshot = False
     for table in source_tables(config):
         name = table["name"]
         filename = table["filename"]
@@ -406,16 +545,108 @@ def run_source_sync(
             continue
         incoming = read_source_csv(incoming_path, nrows=sample_size if source == "csv" else None)
         current = read_source_csv(current_path, nrows=sample_size) if current_path and current_path.exists() else None
-        table_report.update(compare_snapshots(current, incoming, primary_key=primary_key))
+        comparison, changes = compare_snapshot_changes(
+            current,
+            incoming,
+            primary_key=primary_key,
+        )
+        table_report.update(comparison)
         table_report["status"] = "ok"
         report["tables"][name] = table_report
 
+        table_changed = any(changes.values())
+        if not table_changed:
+            continue
+        if current is None:
+            missing_previous_snapshot = True
+        if (
+            comparison["current_duplicate_key_rows"]
+            or comparison["incoming_duplicate_key_rows"]
+            or not comparison["primary_key_available"]
+        ):
+            invalidating_tables.add(name)
+            continue
+        if name == record_table:
+            if primary_key != record_key:
+                invalidating_tables.add(name)
+                continue
+            changed_ids.update(changes["added"] | changes["updated"])
+            removed_ids.update(changes["removed"])
+            continue
+        if name in dependent_tables:
+            parent_key = dependent_tables[name]
+            changed_ids.update(
+                related_record_ids(
+                    incoming,
+                    primary_key=primary_key,
+                    row_keys=changes["added"] | changes["updated"],
+                    record_key=parent_key,
+                )
+            )
+            changed_ids.update(
+                related_record_ids(
+                    current,
+                    primary_key=primary_key,
+                    row_keys=changes["removed"] | changes["updated"],
+                    record_key=parent_key,
+                )
+            )
+            continue
+        if name in full_rebuild_tables or name not in dependent_tables:
+            invalidating_tables.add(name)
+
     if apply and exported:
-        report["apply_actions"] = backup_and_apply(config, exported, backup_dir)
+        actions, pruned = backup_and_apply(
+            config,
+            exported,
+            backup_dir,
+            retention=report["backup_retention"],
+        )
+        report["apply_actions"] = actions
+        report["pruned_backup_directories"] = pruned
+        if pruned:
+            LOGGER.info(
+                "Pruned %s old source snapshot backup director%s; retaining %s.",
+                len(pruned),
+                "y" if len(pruned) == 1 else "ies",
+                report["backup_retention"],
+            )
     elif apply and not exported:
         report["apply_actions"] = []
         report["apply_note"] = "No files were replaced because source=csv uses the existing local snapshots."
 
+    incremental_available = bool(incremental) and source in {"mysql", "postgres"} and apply and sample_size is None
+    if not incremental_available:
+        mode = "unavailable"
+        reason = (
+            "Incremental detection requires profile settings, a full database refresh, "
+            "--apply-source-refresh, and no --sample-size."
+        )
+    elif missing_previous_snapshot:
+        mode = "full"
+        reason = "At least one changed table has no previous snapshot."
+    elif invalidating_tables:
+        mode = "full"
+        reason = "Shared lookup/catalog changes can affect records beyond directly changed ads."
+    elif changed_ids or removed_ids:
+        mode = "incremental"
+        reason = "Only record rows or configured dependent rows changed."
+    else:
+        mode = "no_changes"
+        reason = "No source rows changed."
+    changed_ids.difference_update(removed_ids)
+    change_set_path, incremental_summary = write_incremental_change_set(
+        config,
+        source=source,
+        applied=bool(apply),
+        mode=mode,
+        changed_ids=changed_ids,
+        removed_ids=removed_ids,
+        invalidating_tables=sorted(invalidating_tables),
+        reason=reason,
+    )
+    report["incremental"] = incremental_summary
+    report["incremental"]["change_set_path"] = str(change_set_path)
     write_reports(config, report)
     return report
 
@@ -424,6 +655,10 @@ def print_summary(report: dict[str, Any]) -> None:
     print("\nSource sync complete")
     print(f"Source: {report['source']}")
     print(f"Applied: {report['applied']}")
+    print(
+        f"Backup retention: {report.get('backup_retention', 1)}, "
+        f"pruned={len(report.get('pruned_backup_directories', []))}"
+    )
     for table_name, table_report in report["tables"].items():
         print(
             f"{table_name}: rows {table_report.get('current_rows')} -> {table_report.get('incoming_rows')}, "

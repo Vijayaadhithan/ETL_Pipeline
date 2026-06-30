@@ -20,6 +20,8 @@ class CompanyAdapter(ABC):
         *,
         sample_size: int | None = None,
         strict_subcategory_consistency: bool = False,
+        no_csv: bool = False,
+        record_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Build the canonical pre-retrieval parquet consumed by shared stages."""
 
@@ -30,5 +32,7 @@ class CompanyAdapter(ABC):
         *,
         sample_size: int | None = None,
         strict_subcategory_consistency: bool = False,
+        no_csv: bool = False,
+        record_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         raise ValueError(f"Adapter {self.name!r} does not support legacy stage {stage!r}.")

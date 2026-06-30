@@ -25,12 +25,19 @@ source:
 source_sync:
   staging_dir: output/companies/acme/source_sync/latest
   backup_dir: output/companies/acme/source_sync/backups
+  backup_retention: 1
   tables:
     - name: products
       db_schema: inventory
       db_table: inventory_items
       filename: products.csv
       primary_key: product_code
+
+incremental:
+  record_table: products
+  record_key: product_code
+  dependent_tables: {}
+  full_rebuild_tables: []
 
 adapter_config:
   filename: products.csv

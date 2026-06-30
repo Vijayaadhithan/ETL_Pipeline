@@ -16,6 +16,20 @@ source:
   user_env: MYSQL_USER
   password_env: MYSQL_PASSWORD
 
+incremental:
+  record_table: ads
+  record_key: id
+  dependent_tables:
+    ads_attributes: ads_id
+  full_rebuild_tables:
+    - categories
+    - sub_categories
+    - attributes
+    - attribute_values
+    - states
+    - location
+    - locations
+
 destination:
   backend: mysql
   database_env: MYSQL_DATABASE

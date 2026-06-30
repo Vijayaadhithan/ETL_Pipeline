@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from .config import PipelineConfig
 from .stage3_attributes import clean
+
+
+LOGGER = logging.getLogger("rag_ht_pipeline.stage5_search_ready")
 
 
 REQUIRED_COLUMNS = {
@@ -40,24 +46,32 @@ def cast_search_ready_types(df: pd.DataFrame, config: PipelineConfig | None = No
 
 
 def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool = False) -> dict[str, Any]:
+    started = perf_counter()
     input_path = config.output.final / f"{config.artifact_prefix}_embedding_ready.parquet"
     if not input_path.exists():
         raise FileNotFoundError(f"Missing Stage 4 output: {input_path}")
 
-    df = pd.read_parquet(input_path)
     config.output.final.mkdir(parents=True, exist_ok=True)
-    if sample_size is not None:
-        df = df.head(sample_size).copy()
 
     columns = config.search_ready_columns
     if not columns:
         raise RuntimeError("Missing search_ready.columns in configs/pipeline.yaml.")
-    missing = [column for column in columns if column not in df.columns]
-    required_missing = sorted(REQUIRED_COLUMNS - set(df.columns))
+    available_columns = set(pq.read_schema(input_path).names)
+    missing = [column for column in columns if column not in available_columns]
+    required_missing = sorted(REQUIRED_COLUMNS - available_columns)
     if required_missing:
         raise ValueError(f"Missing required search-ready columns: {required_missing}")
 
-    selected = df[[column for column in columns if column in df.columns]].copy()
+    selected_columns = [column for column in columns if column in available_columns]
+    selected = pd.read_parquet(input_path, columns=selected_columns)
+    if sample_size is not None:
+        selected = selected.head(sample_size).copy()
+    LOGGER.info(
+        "Loaded %s search-ready rows using %s of %s available columns",
+        len(selected),
+        len(selected_columns),
+        len(available_columns),
+    )
     selected = cast_search_ready_types(selected, config)
 
     duplicate_rows = int(selected["id"].duplicated(keep=False).sum()) if "id" in selected.columns else 0
@@ -69,6 +83,8 @@ def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool 
     selected.to_parquet(parquet, index=False)
     if not no_csv:
         selected.to_csv(csv, index=False)
+    else:
+        csv.unlink(missing_ok=True)
 
     report = {
         "input_file": str(input_path),
@@ -79,6 +95,7 @@ def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool 
         "duplicate_ad_id_rows": duplicate_rows,
         "empty_embedding_content_rows": empty_embedding_rows,
         "empty_bm25_content_rows": empty_bm25_rows,
+        "duration_seconds": round(perf_counter() - started, 2),
         "output_files": {"parquet": str(parquet), "csv": str(csv) if not no_csv else ""},
     }
     (config.output.final / "search_ready_report.json").write_text(

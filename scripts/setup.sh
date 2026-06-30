@@ -129,8 +129,11 @@ Next:
        --company gainr \
        --refresh-source configured \
        --apply-source-refresh \
-       --run-all
+       --run-all \
+       --no-csv
 
 Add --publish only when the validated final table should be written to the
-configured destination database.
+configured destination database. After the first full baseline, use:
+
+     ./scripts/run_scheduled_etl.sh gainr --publish
 EOF

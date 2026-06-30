@@ -14,9 +14,20 @@ def read_csv(path: Path, nrows: int | None = None) -> pd.DataFrame:
     return pd.read_csv(path, dtype="string", keep_default_na=True, na_values=NULL_VALUES, nrows=nrows, low_memory=False)
 
 
-def run(config: PipelineConfig, *, sample_size: int | None = None) -> dict[str, Any]:
-    input_file = config.output.intermediate / "ads_stage_01_category_enriched.csv"
-    ads = read_csv(input_file, nrows=sample_size)
+def run(
+    config: PipelineConfig,
+    *,
+    sample_size: int | None = None,
+    no_csv: bool = False,
+) -> dict[str, Any]:
+    parquet_input = config.output.intermediate / "ads_stage_01_category_enriched.parquet"
+    csv_input = config.output.intermediate / "ads_stage_01_category_enriched.csv"
+    if parquet_input.exists():
+        ads = pd.read_parquet(parquet_input).astype("string")
+        if sample_size is not None:
+            ads = ads.head(sample_size).copy()
+    else:
+        ads = read_csv(csv_input, nrows=sample_size)
     states = read_csv(source_file(config, "states.csv"))
     cities = read_csv(source_file(config, "location.csv"))
     localities = read_csv(source_file(config, "locations.csv"))
@@ -124,14 +135,20 @@ def run(config: PipelineConfig, *, sample_size: int | None = None) -> dict[str, 
 
     csv_path = config.output.intermediate / "ads_stage_02_location_enriched.csv"
     parquet_path = config.output.intermediate / "ads_stage_02_location_enriched.parquet"
-    out.to_csv(csv_path, index=False)
     out.to_parquet(parquet_path, index=False)
+    if not no_csv:
+        out.to_csv(csv_path, index=False)
+    else:
+        csv_path.unlink(missing_ok=True)
     report = {
         "input_rows": int(len(ads)),
         "output_rows": int(len(out)),
         "resolved_city": int(city_resolved.sum()),
         "resolved_locality": int(locality_resolved.sum()),
-        "output_files": {"enriched_csv": str(csv_path), "enriched_parquet": str(parquet_path)},
+        "output_files": {
+            "enriched_csv": str(csv_path) if not no_csv else "",
+            "enriched_parquet": str(parquet_path),
+        },
     }
     write_json(config.output.reports / "location_join_report.json", report)
     return report

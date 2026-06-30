@@ -33,12 +33,37 @@ def source_file(config: PipelineConfig, name: str) -> Path:
     raise FileNotFoundError(f"Missing required source file: {name}")
 
 
-def run(config: PipelineConfig, *, sample_size: int | None = None) -> dict[str, Any]:
+def run(
+    config: PipelineConfig,
+    *,
+    sample_size: int | None = None,
+    no_csv: bool = False,
+    record_ids: set[str] | None = None,
+) -> dict[str, Any]:
     ads_path = source_file(config, "ads.csv")
     categories_path = source_file(config, "categories.csv")
     subcategories_path = source_file(config, "sub_categories.csv")
 
-    ads = read_csv(ads_path, nrows=sample_size)
+    if record_ids is None:
+        ads = read_csv(ads_path, nrows=sample_size)
+    else:
+        wanted = {str(value).strip() for value in record_ids}
+        chunks = [
+            chunk[chunk["id"].astype("string").str.strip().isin(wanted)]
+            for chunk in pd.read_csv(
+                ads_path,
+                dtype="string",
+                keep_default_na=True,
+                na_values=NULL_VALUES,
+                chunksize=50_000,
+                low_memory=False,
+            )
+        ]
+        ads = (
+            pd.concat(chunks, ignore_index=True)
+            if chunks
+            else read_csv(ads_path, nrows=0)
+        )
     categories = read_csv(categories_path)
     subcategories = read_csv(subcategories_path)
 
@@ -93,9 +118,14 @@ def run(config: PipelineConfig, *, sample_size: int | None = None) -> dict[str, 
     enriched["category_join_confidence"] = enriched["subcategory_id"].notna().astype(float)
     enriched = enriched.drop(columns=["__subcategory_key", "__main_category_key"], errors="ignore")
 
-    output = config.output.intermediate / "ads_stage_01_category_enriched.csv"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    enriched.to_csv(output, index=False)
+    csv_output = config.output.intermediate / "ads_stage_01_category_enriched.csv"
+    parquet_output = config.output.intermediate / "ads_stage_01_category_enriched.parquet"
+    parquet_output.parent.mkdir(parents=True, exist_ok=True)
+    enriched.to_parquet(parquet_output, index=False)
+    if not no_csv:
+        enriched.to_csv(csv_output, index=False)
+    else:
+        csv_output.unlink(missing_ok=True)
 
     report = {
         "input_rows": int(len(ads)),
@@ -103,7 +133,10 @@ def run(config: PipelineConfig, *, sample_size: int | None = None) -> dict[str, 
         "mapping_selected": "ads.category_id -> sub_categories.id -> categories.id",
         "resolved_rows": int(enriched["subcategory_id"].notna().sum()),
         "unresolved_rows": int(enriched["subcategory_id"].isna().sum()),
-        "output_files": {"enriched_csv": str(output)},
+        "output_files": {
+            "enriched_csv": str(csv_output) if not no_csv else "",
+            "enriched_parquet": str(parquet_output),
+        },
     }
     write_json(config.output.reports / "category_join_report.json", report)
     return report

@@ -15,6 +15,7 @@ paths:
 source_sync:
   staging_dir: output/source_sync/latest
   backup_dir: output/source_sync/backups
+  backup_retention: 1
   tables:
     - name: ads
       db_table: ads

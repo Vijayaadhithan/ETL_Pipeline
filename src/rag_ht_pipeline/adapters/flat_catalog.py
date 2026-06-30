@@ -80,19 +80,35 @@ class FlatCatalogAdapter(CompanyAdapter):
         *,
         sample_size: int | None = None,
         strict_subcategory_consistency: bool = False,
+        no_csv: bool = False,
+        record_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         del strict_subcategory_consistency
         validation = self.validate_sources(config)
         filename, column_map = self._settings(config)
         path = source_file(config, filename)
-        source = pd.read_csv(
-            path,
-            dtype="string",
-            keep_default_na=True,
-            na_values=NULL_VALUES,
-            nrows=sample_size,
-            low_memory=False,
-        )
+        read_options = {
+            "dtype": "string",
+            "keep_default_na": True,
+            "na_values": NULL_VALUES,
+            "low_memory": False,
+        }
+        if record_ids is None:
+            source = pd.read_csv(path, nrows=sample_size, **read_options)
+        else:
+            source_id = column_map["id"]
+            wanted = {str(value).strip() for value in record_ids}
+            chunks = [
+                chunk[
+                    chunk[source_id].astype("string").str.strip().isin(wanted)
+                ]
+                for chunk in pd.read_csv(path, chunksize=50_000, **read_options)
+            ]
+            source = (
+                pd.concat(chunks, ignore_index=True)
+                if chunks
+                else pd.read_csv(path, nrows=0, **read_options)
+            )
         out = pd.DataFrame(index=source.index)
         for canonical in CORE_COLUMNS:
             source_column = column_map.get(canonical)
@@ -125,13 +141,16 @@ class FlatCatalogAdapter(CompanyAdapter):
         parquet = config.output.intermediate / f"{stem}.parquet"
         csv = config.output.intermediate / f"{stem}.csv"
         out.to_parquet(parquet, index=False)
-        out.to_csv(csv, index=False)
+        if not no_csv:
+            out.to_csv(csv, index=False)
+        else:
+            csv.unlink(missing_ok=True)
         report = {
             "adapter": self.name,
             "input_rows": int(len(source)),
             "output_rows": int(len(out)),
             "retained_extra_columns": extra_columns,
-            "output_files": {"parquet": str(parquet), "csv": str(csv)},
+            "output_files": {"parquet": str(parquet), "csv": str(csv) if not no_csv else ""},
         }
         write_json(config.output.reports / "normalization_report.json", report)
         return {"source-validation": validation, "normalization": report}

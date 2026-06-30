@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from .config import PipelineConfig
 from .stage3_attributes import clean, dedupe
+
+
+LOGGER = logging.getLogger("rag_ht_pipeline.stage4_embedding_ready")
+BATCH_SIZE = 25_000
 
 
 LABELS = {
@@ -49,36 +58,115 @@ def plain(row: pd.Series, columns: list[str]) -> str:
     return " ".join(dedupe([clean(row.get(column)) for column in columns]))
 
 
+def enrich_content_frame(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+    enriched = df.copy()
+    enriched["embedding_content"] = enriched.apply(
+        lambda row: labeled(row, config.embedding_source_columns),
+        axis=1,
+    )
+    enriched["bm25_content"] = enriched.apply(
+        lambda row: plain(row, config.bm25_source_columns),
+        axis=1,
+    )
+    enriched["embedding_source_columns_json"] = json.dumps(
+        config.embedding_source_columns,
+        ensure_ascii=False,
+    )
+    enriched["embedding_source_column_count"] = len(config.embedding_source_columns)
+    enriched["embedding_non_empty_source_column_count"] = enriched.apply(
+        lambda row: sum(1 for column in config.embedding_source_columns if clean(row.get(column))),
+        axis=1,
+    )
+    enriched["embedding_content_char_count"] = (
+        enriched["embedding_content"].str.len().fillna(0).astype(int)
+    )
+    enriched["embedding_content_token_estimate"] = (
+        enriched["embedding_content_char_count"] / 4
+    ).round().astype(int)
+    return enriched
+
+
 def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool = False) -> dict[str, Any]:
+    started = perf_counter()
     input_path = config.output.intermediate / f"{config.artifact_prefix}_stage_03_attributes_enriched.parquet"
-    df = pd.read_parquet(input_path)
     config.output.final.mkdir(parents=True, exist_ok=True)
-    if sample_size is not None:
-        df = df.head(sample_size).copy()
-    missing = [c for c in config.embedding_source_columns if c not in df.columns]
+    source = pq.ParquetFile(input_path)
+    missing = [column for column in config.embedding_source_columns if column not in source.schema.names]
     if missing:
         raise ValueError(f"Missing embedding source columns: {missing}")
-    df["embedding_content"] = df.apply(lambda row: labeled(row, config.embedding_source_columns), axis=1)
-    df["bm25_content"] = df.apply(lambda row: plain(row, config.bm25_source_columns), axis=1)
-    df["embedding_source_columns_json"] = json.dumps(config.embedding_source_columns, ensure_ascii=False)
-    df["embedding_source_column_count"] = len(config.embedding_source_columns)
-    df["embedding_non_empty_source_column_count"] = df.apply(
-        lambda row: sum(1 for c in config.embedding_source_columns if clean(row.get(c))), axis=1
-    )
-    df["embedding_content_char_count"] = df["embedding_content"].str.len().fillna(0).astype(int)
-    df["embedding_content_token_estimate"] = (df["embedding_content_char_count"] / 4).round().astype(int)
+
     parquet = config.output.final / f"{config.artifact_prefix}_embedding_ready.parquet"
     csv = config.output.final / f"{config.artifact_prefix}_embedding_ready.csv"
-    df.to_parquet(parquet, index=False)
+    temp_parquet = Path(f"{parquet}.tmp")
+    temp_csv = Path(f"{csv}.tmp")
+    temp_parquet.unlink(missing_ok=True)
+    temp_csv.unlink(missing_ok=True)
+
+    writer: pq.ParquetWriter | None = None
+    writer_schema: pa.Schema | None = None
+    rows_written = 0
+    rows_with_content = 0
+    total_characters = 0
+    csv_header = True
+    remaining = sample_size
+    try:
+        for batch_number, batch in enumerate(source.iter_batches(batch_size=BATCH_SIZE), start=1):
+            if remaining is not None:
+                if remaining <= 0:
+                    break
+                if len(batch) > remaining:
+                    batch = batch.slice(0, remaining)
+                remaining -= len(batch)
+            frame = enrich_content_frame(batch.to_pandas(), config)
+            table = pa.Table.from_pandas(frame, preserve_index=False)
+            if writer is None:
+                writer_schema = table.schema
+                writer = pq.ParquetWriter(temp_parquet, writer_schema, compression="snappy")
+            elif table.schema != writer_schema:
+                table = table.cast(writer_schema)
+            writer.write_table(table)
+            if not no_csv:
+                frame.to_csv(
+                    temp_csv,
+                    mode="w" if csv_header else "a",
+                    header=csv_header,
+                    index=False,
+                )
+                csv_header = False
+            rows_written += len(frame)
+            rows_with_content += int(frame["embedding_content"].map(clean).ne("").sum())
+            total_characters += int(frame["embedding_content_char_count"].sum())
+            LOGGER.info(
+                "Embedding-ready batch %s complete: rows=%s total=%s",
+                batch_number,
+                len(frame),
+                rows_written,
+            )
+    except Exception:
+        temp_parquet.unlink(missing_ok=True)
+        temp_csv.unlink(missing_ok=True)
+        raise
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if rows_written == 0:
+        raise RuntimeError(f"No rows were read from Stage 3 output: {input_path}")
+    temp_parquet.replace(parquet)
     if not no_csv:
-        df.to_csv(csv, index=False)
+        temp_csv.replace(csv)
+    else:
+        csv.unlink(missing_ok=True)
+
     report = {
-        "input_rows": int(len(df)),
+        "input_rows": rows_written,
         "embedding_source_column_count": len(config.embedding_source_columns),
         "bm25_source_column_count": len(config.bm25_source_columns),
-        "rows_with_embedding_content": int(df["embedding_content"].map(clean).ne("").sum()),
-        "average_embedding_content_char_count": round(float(df["embedding_content_char_count"].mean()), 2),
-        "output_files": {"parquet": str(parquet), "csv": str(csv)},
+        "rows_with_embedding_content": rows_with_content,
+        "average_embedding_content_char_count": round(total_characters / rows_written, 2),
+        "batch_size": BATCH_SIZE,
+        "duration_seconds": round(perf_counter() - started, 2),
+        "output_files": {"parquet": str(parquet), "csv": str(csv) if not no_csv else ""},
     }
     (config.output.final / "embedding_ready_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report

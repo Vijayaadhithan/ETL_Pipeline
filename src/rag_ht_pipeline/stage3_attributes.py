@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import gc
 import json
+import logging
 from collections import defaultdict
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -11,8 +14,29 @@ from .config import PipelineConfig
 from .stage1_category import NULL_VALUES, key, source_file, write_json
 
 
+LOGGER = logging.getLogger("rag_ht_pipeline.stage3_attributes")
+
+
 def read_csv(path: Path, nrows: int | None = None) -> pd.DataFrame:
     return pd.read_csv(path, dtype="string", keep_default_na=True, na_values=NULL_VALUES, nrows=nrows, low_memory=False)
+
+
+def read_bridge_for_ads(path: Path, ad_ids: set[int]) -> pd.DataFrame:
+    chunks = []
+    for chunk in pd.read_csv(
+        path,
+        dtype="string",
+        keep_default_na=True,
+        na_values=NULL_VALUES,
+        chunksize=100_000,
+        low_memory=False,
+    ):
+        selected = chunk[key(chunk["ads_id"]).isin(ad_ids)]
+        if not selected.empty:
+            chunks.append(selected)
+    if chunks:
+        return pd.concat(chunks, ignore_index=True)
+    return read_csv(path, nrows=0)
 
 
 def clean(value: Any) -> str:
@@ -106,16 +130,23 @@ def aggregate_group(rows: pd.DataFrame) -> dict[str, Any]:
     attr_ids: dict[str, list[int]] = defaultdict(list)
     value_ids: dict[str, list[int]] = defaultdict(list)
     keywords: list[str] = []
-    for row in rows.to_dict(orient="records"):
-        name = clean(row.get("attribute_name")) or "Unknown Attribute"
-        value = clean(row.get("attribute_value"))
+    columns = [
+        "attribute_name",
+        "attribute_value",
+        "attribute_value_id",
+        "attribute_value_keywords",
+    ]
+    for name_raw, value_raw, attribute_value_id, keywords_raw in rows[columns].itertuples(
+        index=False,
+        name=None,
+    ):
+        name = clean(name_raw) or "Unknown Attribute"
+        value = clean(value_raw)
         if value:
             by_attr[name].append(value)
-        if pd.notna(row.get("attribute_id")):
-            attr_ids[name].append(int(row["attribute_id"]))
-        if pd.notna(row.get("attribute_value_id")):
-            value_ids[name].append(int(row["attribute_value_id"]))
-        keywords.extend([part.strip() for part in clean(row.get("attribute_value_keywords")).split(",") if part.strip()])
+        if pd.notna(attribute_value_id):
+            value_ids[name].append(int(attribute_value_id))
+        keywords.extend([part.strip() for part in clean(keywords_raw).split(",") if part.strip()])
     by_attr = {k: dedupe(v) for k, v in by_attr.items()}
     attr_ids = {k: sorted(set(v)) for k, v in attr_ids.items()}
     value_ids = {k: sorted(set(v)) for k, v in value_ids.items()}
@@ -137,11 +168,34 @@ def run(
     *,
     sample_size: int | None = None,
     strict_subcategory_consistency: bool = False,
+    no_csv: bool = False,
 ) -> dict[str, Any]:
-    ads = read_csv(config.output.intermediate / "ads_stage_02_location_enriched.csv", nrows=sample_size)
+    started = perf_counter()
+    parquet_input = config.output.intermediate / "ads_stage_02_location_enriched.parquet"
+    csv_input = config.output.intermediate / "ads_stage_02_location_enriched.csv"
+    if parquet_input.exists():
+        ads = pd.read_parquet(parquet_input).astype("string")
+        if sample_size is not None:
+            ads = ads.head(sample_size).copy()
+    else:
+        ads = read_csv(csv_input, nrows=sample_size)
+    input_rows = len(ads)
+    LOGGER.info("Loaded %s ads for attribute normalization", len(ads))
+
     catalog = build_catalog(config)
-    ads_attributes = read_csv(source_file(config, "ads_attributes.csv"))
-    attrs = read_csv(source_file(config, "attributes.csv"))
+    bridge_path = source_file(config, "ads_attributes.csv")
+    if input_rows < 100_000:
+        selected_ad_ids = {
+            int(value) for value in key(ads["id"]).dropna().tolist()
+        }
+        ads_attributes = read_bridge_for_ads(bridge_path, selected_ad_ids)
+    else:
+        ads_attributes = read_csv(bridge_path)
+    LOGGER.info(
+        "Loaded attribute bridge rows=%s and catalog rows=%s",
+        len(ads_attributes),
+        len(catalog),
+    )
 
     bridge = ads_attributes.assign(
         __ad=key(ads_attributes["ads_id"]),
@@ -157,9 +211,27 @@ def run(
     bridge["__schema_match"] = bridge["__attr_sub"].notna() & bridge["__ad_sub"].notna() & (bridge["__attr_sub"] == bridge["__ad_sub"])
     mismatches = bridge[bridge["__attr_sub"].notna() & bridge["__ad_sub"].notna() & ~bridge["__schema_match"]]
     usable = bridge[bridge["__schema_match"]].copy()
+    LOGGER.info(
+        "Attribute bridge validation complete: usable=%s mismatches=%s",
+        len(usable),
+        len(mismatches),
+    )
 
-    grouped = {int(ad): aggregate_group(group) for ad, group in usable.groupby("__ad", dropna=True)}
-    out = ads.copy()
+    aggregation_started = perf_counter()
+    grouped_records = [
+        {"__ad": int(ad_id), "__mapped": True, **aggregate_group(group)}
+        for ad_id, group in usable.groupby("__ad", dropna=True, sort=False)
+    ]
+    aggregated = pd.DataFrame(grouped_records)
+    del grouped_records
+    LOGGER.info(
+        "Aggregated attributes for %s ads in %.2fs",
+        len(aggregated),
+        perf_counter() - aggregation_started,
+    )
+
+    out = ads
+    del ads
     defaults = {
         "attribute_count": 0,
         "attribute_value_count": 0,
@@ -170,44 +242,68 @@ def run(
         "attribute_values_text": "",
         "attribute_keywords_text": "",
     }
-    for column in defaults:
-        out[column] = defaults[column]
-    out["attribute_mapping_source"] = "unresolved"
-    out["attribute_mapping_status"] = "no_ad_attribute_bridge"
-    out["attribute_mapping_confidence"] = 0.0
-    out["attribute_subcategory_consistency_status"] = "not_applicable"
-    out["attribute_schema_mapping_status"] = "schema_available"
+    out["__ad"] = key(out["id"])
+    if aggregated.empty:
+        mapped = pd.Series(False, index=out.index)
+        for column, default in defaults.items():
+            out[column] = default
+    else:
+        if aggregated["__ad"].duplicated().any():
+            raise ValueError("Attribute aggregation produced duplicate ad IDs.")
+        aggregated = aggregated.set_index("__ad")
+        mapped = out["__ad"].isin(aggregated.index)
+        for column, default in defaults.items():
+            out[column] = out["__ad"].map(aggregated[column]).fillna(default)
+    del bridge, usable, ads_attributes, ad_keys, cat
+    gc.collect()
+    out["attribute_count"] = pd.to_numeric(out["attribute_count"], errors="coerce").fillna(0).astype("int64")
+    out["attribute_value_count"] = (
+        pd.to_numeric(out["attribute_value_count"], errors="coerce").fillna(0).astype("int64")
+    )
+    out["attribute_mapping_source"] = mapped.map(
+        {True: "explicit_bridge_table", False: "unresolved"}
+    )
+    out["attribute_mapping_status"] = mapped.map(
+        {True: "bridge_table_mapped", False: "no_ad_attribute_bridge"}
+    )
+    out["attribute_mapping_confidence"] = mapped.astype(float)
+    out["attribute_subcategory_consistency_status"] = mapped.map(
+        {True: "consistent", False: "not_applicable"}
+    )
+    out["attribute_schema_mapping_status"] = mapped.map(
+        {True: "schema_matched", False: "schema_available"}
+    )
     out["custom_cat_value_raw"] = out.get("custom_cat_value", "")
     out["custom_cat_value_detected_format"] = "not_used_for_attribute_mapping"
     out["custom_cat_value_parse_status"] = "not_applicable"
     out["custom_cat_value_parsed_ids_json"] = "[]"
     out["custom_cat_value_unparsed_tokens_json"] = "[]"
-    for idx, row in out.iterrows():
-        ad_id = int(key(pd.Series([row["id"]])).iloc[0]) if pd.notna(key(pd.Series([row["id"]])).iloc[0]) else None
-        if ad_id in grouped:
-            for column, value in grouped[ad_id].items():
-                out.at[idx, column] = value
-            out.at[idx, "attribute_mapping_source"] = "explicit_bridge_table"
-            out.at[idx, "attribute_mapping_status"] = "bridge_table_mapped"
-            out.at[idx, "attribute_mapping_confidence"] = 1.0
-            out.at[idx, "attribute_subcategory_consistency_status"] = "consistent"
-            out.at[idx, "attribute_schema_mapping_status"] = "schema_matched"
+    out["company_id"] = config.company_id
+    out["extras_json"] = "{}"
+    out = out.drop(columns=["__ad"], errors="ignore")
 
     csv_path = config.output.intermediate / "ads_stage_03_attributes_enriched.csv"
     parquet_path = config.output.intermediate / "ads_stage_03_attributes_enriched.parquet"
     catalog_path = config.output.diagnostics / "subcategory_attribute_catalog.csv"
     mismatch_path = config.output.diagnostics / "ad_attribute_schema_mismatches.csv"
-    out.to_csv(csv_path, index=False)
     out.to_parquet(parquet_path, index=False)
+    if not no_csv:
+        out.to_csv(csv_path, index=False)
+    else:
+        csv_path.unlink(missing_ok=True)
     catalog.to_csv(catalog_path, index=False)
     mismatches.to_csv(mismatch_path, index=False)
     report = {
-        "input_rows": int(len(ads)),
+        "input_rows": int(input_rows),
         "output_rows": int(len(out)),
         "confirmed_bridge_table": "ads_attributes.csv",
         "mapped_ads": int((out["attribute_mapping_source"] == "explicit_bridge_table").sum()),
         "schema_mismatch_rows": int(len(mismatches)),
-        "output_files": {"enriched_csv": str(csv_path), "enriched_parquet": str(parquet_path)},
+        "duration_seconds": round(perf_counter() - started, 2),
+        "output_files": {
+            "enriched_csv": str(csv_path) if not no_csv else "",
+            "enriched_parquet": str(parquet_path),
+        },
     }
     write_json(config.output.reports / "attribute_mapping_report.json", report)
     return report

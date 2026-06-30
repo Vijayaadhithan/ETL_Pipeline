@@ -43,7 +43,12 @@ from rag_ht_pipeline.source_sync import (  # noqa: E402
     related_record_ids,
     resolve_source_backend,
 )
-from rag_ht_pipeline.stage3_attributes import clean, dedupe  # noqa: E402
+from rag_ht_pipeline.stage3_attributes import (  # noqa: E402
+    aggregate_group,
+    aggregate_usable_rows,
+    clean,
+    dedupe,
+)
 from rag_ht_pipeline.stage4_embedding_ready import run as build_retrieval_content  # noqa: E402
 from rag_ht_pipeline.stage5_search_ready import run as build_search_ready  # noqa: E402
 from rag_ht_pipeline.stage5_search_ready import cast_search_ready_types  # noqa: E402
@@ -142,6 +147,48 @@ def test_clean_and_dedupe_helpers() -> None:
     assert clean("  NULL ") == ""
     assert clean(" hello   world ") == "hello world"
     assert dedupe(["A", "a", "", "B"]) == ["A", "B"]
+
+
+def test_single_pass_attribute_aggregation_matches_legacy_grouping() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "__ad": 2,
+                "attribute_name": "Color",
+                "attribute_value": "Red",
+                "attribute_value_id": 20,
+                "attribute_value_keywords": "warm, bright",
+            },
+            {
+                "__ad": 1,
+                "attribute_name": "Size",
+                "attribute_value": "Large",
+                "attribute_value_id": 10,
+                "attribute_value_keywords": "large",
+            },
+            {
+                "__ad": 2,
+                "attribute_name": "Color",
+                "attribute_value": "red",
+                "attribute_value_id": 20,
+                "attribute_value_keywords": "bright",
+            },
+        ]
+    )
+    expected = {
+        int(ad_id): aggregate_group(group)
+        for ad_id, group in rows.groupby("__ad", sort=False)
+    }
+    actual = {
+        record["__ad"]: {
+            key: value
+            for key, value in record.items()
+            if key not in {"__ad", "__mapped"}
+        }
+        for record in aggregate_usable_rows(rows)
+    }
+
+    assert actual == expected
 
 
 def test_source_sync_detects_added_removed_and_updated_rows() -> None:

@@ -163,6 +163,99 @@ def aggregate_group(rows: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def aggregate_usable_rows(rows: pd.DataFrame) -> list[dict[str, Any]]:
+    columns = [
+        "__ad",
+        "attribute_name",
+        "attribute_value",
+        "attribute_value_id",
+        "attribute_value_keywords",
+    ]
+    ordered = rows
+    if not rows["__ad"].is_monotonic_increasing:
+        ordered = rows.sort_values("__ad", kind="stable")
+
+    records: list[dict[str, Any]] = []
+    current_ad: int | None = None
+    by_attr: dict[str, list[str]] = defaultdict(list)
+    value_ids: dict[str, list[int]] = defaultdict(list)
+    keywords: list[str] = []
+
+    def finish() -> None:
+        if current_ad is None:
+            return
+        deduped_attributes = {
+            name: dedupe(values) for name, values in by_attr.items()
+        }
+        deduped_value_ids = {
+            name: sorted(set(values)) for name, values in value_ids.items()
+        }
+        values_flat = [
+            value
+            for values in deduped_attributes.values()
+            for value in values
+        ]
+        records.append(
+            {
+                "__ad": current_ad,
+                "__mapped": True,
+                "attribute_count": len(deduped_attributes),
+                "attribute_value_count": sum(
+                    len(values) for values in deduped_attributes.values()
+                ),
+                "attribute_ids_json": "{}",
+                "attribute_value_ids_json": json.dumps(
+                    deduped_value_ids,
+                    ensure_ascii=False,
+                ),
+                "attributes_json": json.dumps(
+                    deduped_attributes,
+                    ensure_ascii=False,
+                ),
+                "attributes_text": ". ".join(
+                    f"{name}: {', '.join(values)}"
+                    for name, values in deduped_attributes.items()
+                )
+                + ("." if deduped_attributes else ""),
+                "attribute_values_text": ". ".join(dedupe(values_flat))
+                + ("." if values_flat else ""),
+                "attribute_keywords_text": ", ".join(dedupe(keywords)),
+            }
+        )
+
+    for (
+        ad_id_raw,
+        name_raw,
+        value_raw,
+        attribute_value_id,
+        keywords_raw,
+    ) in ordered[columns].itertuples(index=False, name=None):
+        if pd.isna(ad_id_raw):
+            continue
+        ad_id = int(ad_id_raw)
+        if current_ad != ad_id:
+            finish()
+            current_ad = ad_id
+            by_attr = defaultdict(list)
+            value_ids = defaultdict(list)
+            keywords = []
+
+        name = clean(name_raw) or "Unknown Attribute"
+        value = clean(value_raw)
+        if value:
+            by_attr[name].append(value)
+        if pd.notna(attribute_value_id):
+            value_ids[name].append(int(attribute_value_id))
+        keywords.extend(
+            part.strip()
+            for part in clean(keywords_raw).split(",")
+            if part.strip()
+        )
+
+    finish()
+    return records
+
+
 def run(
     config: PipelineConfig,
     *,
@@ -218,10 +311,7 @@ def run(
     )
 
     aggregation_started = perf_counter()
-    grouped_records = [
-        {"__ad": int(ad_id), "__mapped": True, **aggregate_group(group)}
-        for ad_id, group in usable.groupby("__ad", dropna=True, sort=False)
-    ]
+    grouped_records = aggregate_usable_rows(usable)
     aggregated = pd.DataFrame(grouped_records)
     del grouped_records
     LOGGER.info(

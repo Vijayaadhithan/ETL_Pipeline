@@ -272,6 +272,17 @@ Watch artifact progress:
 watch -n 10 'find output -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %10s %p\n" | sort | tail -20'
 ```
 
+If a full run completed `embedding-ready` but stopped during `search-ready`,
+resume without repeating source refresh, normalization, or content generation:
+
+```bash
+PYTHONUNBUFFERED=1 .venv/bin/rag-ht-pipeline \
+  --company gainr \
+  --stage search-ready \
+  --stage validate \
+  --no-csv
+```
+
 ## Outputs and Reports
 
 Authoritative Gainr output:

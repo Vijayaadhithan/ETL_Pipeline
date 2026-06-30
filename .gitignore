@@ -22,3 +22,4 @@ output/diagnostics/
 output/
 *.jsonl
 .env
+.venv/

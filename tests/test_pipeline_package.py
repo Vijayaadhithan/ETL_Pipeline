@@ -1,22 +1,45 @@
 from __future__ import annotations
 
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
-from rag_ht_pipeline.config import load_config  # noqa: E402
+from rag_ht_pipeline.adapters import get_adapter  # noqa: E402
+from rag_ht_pipeline.config import (  # noqa: E402
+    discover_company_profiles,
+    load_company_config,
+    load_config,
+    validate_company_slug,
+)
 from rag_ht_pipeline.mysql_loader import mysql_url_from_env  # noqa: E402
 from rag_ht_pipeline.mysql_source_loader import load_sources_to_mysql  # noqa: E402
+from rag_ht_pipeline.pipeline import run_batch, validate_company_isolation  # noqa: E402
 from rag_ht_pipeline.postgres_loader import read_input  # noqa: E402
-from rag_ht_pipeline.source_sync import compare_snapshots  # noqa: E402
+from rag_ht_pipeline.publisher import (  # noqa: E402
+    _mysql_publish,
+    credential_value,
+    publish_company,
+    validate_publish_frame,
+)
+from rag_ht_pipeline.source_sync import (  # noqa: E402
+    compare_snapshots,
+    database_url,
+    qualified_table_name,
+    resolve_source_backend,
+)
 from rag_ht_pipeline.stage3_attributes import clean, dedupe  # noqa: E402
+from rag_ht_pipeline.stage4_embedding_ready import run as build_retrieval_content  # noqa: E402
+from rag_ht_pipeline.stage5_search_ready import run as build_search_ready  # noqa: E402
 from rag_ht_pipeline.stage5_search_ready import cast_search_ready_types  # noqa: E402
+from rag_ht_pipeline.validation import run_final_verification  # noqa: E402
 
 
 def test_config_has_full_embedding_and_bm25_columns() -> None:
@@ -25,7 +48,11 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "attributes_text" in config.embedding_source_columns
     assert "attribute_values_text" in config.embedding_source_columns
     assert len(config.bm25_source_columns) == 21
-    assert len(config.search_ready_columns) == 36
+    assert len(config.search_ready_columns) == 38
+    assert config.company_id == "gainr"
+    assert config.adapter == "gainr"
+    assert "company_id" in config.search_ready_columns
+    assert "extras_json" in config.search_ready_columns
     assert "embedding_content" in config.search_ready_columns
     assert "bm25_content" in config.search_ready_columns
     assert "embedding_source_columns_json" not in config.search_ready_columns
@@ -133,3 +160,305 @@ def test_source_sync_detects_added_removed_and_updated_rows() -> None:
     assert report["sample_added_keys"] == ["4"]
     assert report["sample_removed_keys"] == ["3"]
     assert report["sample_updated_keys"] == ["1"]
+
+
+def _write_flat_profile(tmp_path: Path, slug: str, output_root: Path) -> Path:
+    companies = tmp_path / "configs" / "companies"
+    companies.mkdir(parents=True, exist_ok=True)
+    profile = companies / f"{slug}.yaml"
+    profile.write_text(
+        f"""
+company:
+  id: {slug}
+  adapter: flat_catalog
+  artifact_prefix: catalog
+paths:
+  input_dir: {tmp_path / "data" / slug}
+  data_dir: {tmp_path / "data" / slug}
+  output_root: {output_root}
+  intermediate_dir: {output_root / "intermediate"}
+  final_dir: {output_root / "final"}
+  reports_dir: {output_root / "reports"}
+  diagnostics_dir: {output_root / "diagnostics"}
+source:
+  backend: csv
+adapter_config:
+  filename: products.csv
+  extra_columns:
+    - source_reference
+  column_map:
+    id: product_code
+    title: product_name
+    description: details
+    status: availability
+search_ready:
+  columns:
+    - company_id
+    - id
+    - title
+    - description
+    - status
+    - brand
+    - embedding_content
+    - bm25_content
+    - extras_json
+  filter_columns:
+    - brand
+embedding:
+  source_columns: [title, description]
+bm25:
+  source_columns: [title, description, brand]
+credentials:
+  env_file: {tmp_path / f".env.{slug}"}
+destination:
+  backend: mysql
+  database_env: {slug.upper()}_MYSQL_DATABASE
+  user_env: {slug.upper()}_MYSQL_USER
+  password_env: {slug.upper()}_MYSQL_PASSWORD
+  table: search_ready
+""",
+        encoding="utf-8",
+    )
+    return companies
+
+
+def test_company_profile_loading_and_slug_validation(tmp_path: Path) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    profiles = discover_company_profiles(companies)
+    config = load_company_config("acme", companies_dir=companies)
+
+    assert profiles == {"acme": companies / "acme.yaml"}
+    assert config.company_id == "acme"
+    assert config.adapter == "flat_catalog"
+    assert resolve_source_backend(config, "configured") == "csv"
+    assert config.output.root == tmp_path / "output" / "acme"
+    with pytest.raises(ValueError, match="Unsafe company slug"):
+        validate_company_slug("../acme")
+
+
+def test_gainr_profile_selects_mysql_source() -> None:
+    config = load_company_config("gainr", companies_dir=PROJECT_ROOT / "configs" / "companies")
+
+    assert config.source["backend"] == "mysql"
+    assert resolve_source_backend(config, "configured") == "mysql"
+    assert resolve_source_backend(config, "postgres") == "postgres"
+
+
+def test_postgres_source_uses_profile_credentials_and_qualified_table(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    config = load_company_config("acme", companies_dir=companies)
+    object.__setattr__(
+        config,
+        "source",
+        {
+            "backend": "postgres",
+            "schema": "inventory",
+            "host_env": "ACME_SOURCE_HOST",
+            "port_env": "ACME_SOURCE_PORT",
+            "database_env": "ACME_SOURCE_DATABASE",
+            "user_env": "ACME_SOURCE_USER",
+            "password_env": "ACME_SOURCE_PASSWORD",
+        },
+    )
+    env_file = tmp_path / ".env.source"
+    env_file.write_text(
+        "\n".join(
+            [
+                "ACME_SOURCE_HOST=postgres.internal",
+                "ACME_SOURCE_PORT=5433",
+                "ACME_SOURCE_DATABASE=acme catalog",
+                "ACME_SOURCE_USER=source user",
+                "ACME_SOURCE_PASSWORD=source pass",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    for name in [
+        "ACME_SOURCE_HOST",
+        "ACME_SOURCE_PORT",
+        "ACME_SOURCE_DATABASE",
+        "ACME_SOURCE_USER",
+        "ACME_SOURCE_PASSWORD",
+    ]:
+        monkeypatch.delenv(name, raising=False)
+
+    url = database_url(config, "postgres", env_file=env_file)
+    qualified = qualified_table_name(
+        {"db_table": "inventory_items"},
+        "postgres",
+        default_schema=config.source["schema"],
+    )
+
+    assert url == (
+        "postgresql+psycopg://source+user:source+pass@"
+        "postgres.internal:5433/acme+catalog"
+    )
+    assert qualified == '"inventory"."inventory_items"'
+
+
+def test_flat_catalog_adapter_emits_canonical_isolated_artifacts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data" / "acme"
+    data_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "product_code": "P-1",
+                "product_name": "Cordless Drill",
+                "details": "18V drill",
+                "availability": "active",
+                "brand": "Example",
+                "source_reference": "SRC-99",
+                "private_note": "must not be retained",
+            }
+        ]
+    ).to_csv(data_dir / "products.csv", index=False)
+    output_root = tmp_path / "output" / "acme"
+    companies = _write_flat_profile(tmp_path, "acme", output_root)
+    config = load_company_config("acme", companies_dir=companies)
+
+    report = get_adapter(config.adapter).normalize(config)
+    build_retrieval_content(config, no_csv=True)
+    build_search_ready(config, no_csv=True)
+    verification = run_final_verification(config)
+    normalized = pd.read_parquet(output_root / "intermediate" / "catalog_stage_03_attributes_enriched.parquet")
+    final = pd.read_parquet(output_root / "final" / "catalog_search_ready.parquet")
+
+    assert report["normalization"]["output_rows"] == 1
+    assert normalized.loc[0, "company_id"] == "acme"
+    assert normalized.loc[0, "id"] == "P-1"
+    assert normalized.loc[0, "brand"] == "Example"
+    assert "source_reference" in normalized.loc[0, "extras_json"]
+    assert "private_note" not in normalized.loc[0, "extras_json"]
+    assert final.loc[0, "id"] == "P-1"
+    assert final.loc[0, "embedding_content"] == "Title: Cordless Drill Description: 18V drill"
+    assert verification["status"] == "PASS"
+    assert not (tmp_path / "output" / "gainr").exists()
+
+
+def test_company_credentials_are_resolved_from_separate_files(tmp_path: Path, monkeypatch) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    env_file = tmp_path / ".env.acme"
+    env_file.write_text(
+        "ACME_MYSQL_DATABASE=acme_db\nACME_MYSQL_USER=acme_user\nACME_MYSQL_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("ACME_MYSQL_DATABASE", raising=False)
+    config = load_company_config("acme", companies_dir=companies)
+
+    assert credential_value(config, "database_env", "MYSQL_DATABASE") == "acme_db"
+    assert credential_value(config, "user_env", "MYSQL_USER") == "acme_user"
+
+
+def test_publish_dry_run_validates_without_database_connection(tmp_path: Path) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    (tmp_path / ".env.acme").write_text(
+        "ACME_MYSQL_DATABASE=acme_db\nACME_MYSQL_USER=acme_user\nACME_MYSQL_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    config = load_company_config("acme", companies_dir=companies)
+    config.output.final.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "company_id": "acme",
+                "id": "P-1",
+                "title": "Drill",
+                "description": "18V",
+                "embedding_content": "Title: Drill",
+                "bm25_content": "Drill 18V",
+                "extras_json": "{}",
+            }
+        ]
+    ).to_parquet(config.output.final / "catalog_search_ready.parquet", index=False)
+
+    report = publish_company(config, dry_run=True)
+
+    assert report["published"] is False
+    assert report["validation"]["rows"] == 1
+
+    invalid = pd.DataFrame(
+        [
+            {
+                "company_id": "another-company",
+                "id": "P-1",
+                "title": "Drill",
+                "description": "18V",
+                "embedding_content": "",
+                "bm25_content": "Drill",
+                "extras_json": "{}",
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="Cannot publish invalid data"):
+        validate_publish_frame(config, invalid)
+
+
+def test_isolation_rejects_shared_output_or_destination(tmp_path: Path) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "shared")
+    first = load_company_config("acme", companies_dir=companies)
+    second = load_company_config("acme", companies_dir=companies)
+    object.__setattr__(second, "company_id", "other")
+
+    with pytest.raises(ValueError, match="share output root"):
+        validate_company_isolation([first, second])
+
+
+def test_mysql_publish_uses_one_atomic_swap_statement(monkeypatch) -> None:
+    statements: list[str] = []
+
+    class Result:
+        def scalar_one(self) -> int:
+            return 1
+
+    class Connection:
+        def execute(self, statement: object) -> Result:
+            statements.append(str(statement))
+            return Result()
+
+    class Inspector:
+        def has_table(self, table: str) -> bool:
+            return table == "search_ready"
+
+    monkeypatch.setattr("sqlalchemy.inspect", lambda connection: Inspector())
+    monkeypatch.setattr(pd.DataFrame, "to_sql", lambda self, *args, **kwargs: None)
+    frame = pd.DataFrame([{"id": "P-1"}])
+
+    _mysql_publish(
+        Connection(),
+        frame,
+        "search_ready",
+        "search_ready__staging_1234",
+        "search_ready__backup_1234",
+    )
+
+    rename = [statement for statement in statements if statement.startswith("RENAME TABLE")]
+    assert rename == [
+        "RENAME TABLE `search_ready` TO `search_ready__backup_1234`, "
+        "`search_ready__staging_1234` TO `search_ready`"
+    ]
+    assert statements[-1] == "DROP TABLE `search_ready__backup_1234`"
+
+
+def test_batch_continues_after_company_failure(tmp_path: Path, monkeypatch) -> None:
+    first = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
+    second = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
+    object.__setattr__(first, "company_id", "first")
+    object.__setattr__(second, "company_id", "second")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("rag_ht_pipeline.pipeline.selected_configs", lambda args: [first, second])
+
+    def fake_run(args: Namespace, config: object) -> dict[str, object]:
+        if config.company_id == "first":
+            raise ValueError("bad source")
+        return {"validate": {"status": "PASS"}}
+
+    monkeypatch.setattr("rag_ht_pipeline.pipeline.run_company_pipeline", fake_run)
+    result = run_batch(Namespace())
+
+    assert result["status"] == "FAIL"
+    assert result["companies"]["first"]["status"] == "FAIL"
+    assert result["companies"]["second"]["status"] == "PASS"
+    assert (tmp_path / "output" / "reports" / "company_batch_report.json").exists()

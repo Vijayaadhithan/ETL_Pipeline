@@ -1,8 +1,142 @@
-# RAG_HT Rental Marketplace Pipeline
+# RAG_HT Multi-Company Catalog Pipeline
 
-This repository builds a verified, embedding-ready rental marketplace dataset from relational CSV exports. The pipeline preserves the source ad rows, enriches IDs into readable category/location/attribute fields, and produces text fields for later semantic search and keyword search.
+This repository builds verified, search-ready catalog datasets from company-specific source schemas. Each company has an adapter for its own joins and normalization, while shared stages build semantic/keyword text, validate the canonical contract, and optionally publish to an isolated database.
 
 It does **not** create vector embeddings yet. The current final output is clean retrieval/search text plus structured metadata.
+
+## New System Setup
+
+Prerequisites:
+
+- Linux or macOS
+- Python 3.11 or newer
+- Network access to the configured Python package index during installation
+
+After cloning or copying the repository code:
+
+```bash
+cd /path/to/RAG_HT
+./scripts/setup.sh
+```
+
+The setup script:
+
+- creates or reuses `.venv`
+- installs the ETL package and all MySQL/PostgreSQL Python drivers
+- installs test dependencies
+- creates `.env` from `.env.example` only when `.env` is missing
+- preserves every existing `.env`
+- creates empty output directories
+- verifies company profiles and adapters
+- runs the test suite
+
+It does not copy, download, generate, or modify company CSV/source data.
+
+Skip tests when preparing a minimal runtime:
+
+```bash
+./scripts/setup.sh --skip-tests
+```
+
+Use a specific Python executable when needed:
+
+```bash
+PYTHON_BIN=/usr/bin/python3.11 ./scripts/setup.sh
+```
+
+The editable installation also provides shorter commands:
+
+```bash
+.venv/bin/rag-ht-pipeline --help
+.venv/bin/rag-ht-source-sync --help
+```
+
+## Gainr Quick Start
+
+Run these commands from the repository root.
+
+Normal Gainr ETL using the current local CSV files:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company gainr \
+  --run-all
+```
+
+After running `scripts/setup.sh`, the equivalent shorter command is:
+
+```bash
+.venv/bin/rag-ht-pipeline \
+  --company gainr \
+  --run-all
+```
+
+Fast 1,000-row verification run:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company gainr \
+  --run-all \
+  --sample-size 1000 \
+  --no-csv
+```
+
+Refresh Gainr source tables from MySQL, back up and replace the local CSV snapshots, then rebuild:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company gainr \
+  --refresh-source mysql \
+  --apply-source-refresh \
+  --run-all
+```
+
+Validate the existing final artifact and publishing configuration without writing to MySQL:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company gainr \
+  --publish-dry-run
+```
+
+Rebuild and atomically publish `ads_search_ready` to Gainr's configured destination database:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company gainr \
+  --run-all \
+  --publish
+```
+
+The normal and sample commands only write local artifacts under `output/`. Database publishing happens only when `--publish` is explicitly supplied.
+
+## Multi-Company Model
+
+Company profiles live in:
+
+```text
+configs/companies/
+```
+
+The current company is `gainr`, which remains the default and keeps the existing root input files, `output/` layout, and `ads_search_ready` table name.
+
+Additional companies use isolated paths:
+
+```text
+data/companies/<company>/incoming/
+output/companies/<company>/
+```
+
+Each profile independently selects `source.backend: csv`, `mysql`, or `postgres`. PostgreSQL sources may set a default `source.schema`, and any table may override it with `db_schema`. The destination backend is configured separately, so a company can read from PostgreSQL and publish to MySQL, or the reverse.
+
+One company profile currently represents one source database connection. If a company needs joins across multiple databases, implement that explicitly in its adapter rather than mixing credentials or cross-database joins into the shared pipeline.
+
+The adapters currently available are:
+
+- `gainr`: the existing relational ads/category/location/attribute pipeline.
+- `flat_catalog`: a single-file catalog adapter with configurable source-to-canonical field mapping.
+
+Adapters must emit `company_id`, `id`, `title`, `description`, and `extras_json`. Shared stages add `embedding_content` and `bm25_content`. Standard catalog fields may be empty when a company does not provide them; typed company-specific filters are declared in that profile.
 
 ## Current Final Outputs
 
@@ -38,6 +172,8 @@ embedding source columns: 23
 empty embedding_content rows: 0
 ```
 
+After the multi-company migration, the clean Gainr output has 38 columns, including `company_id` and `extras_json`.
+
 ## Pipeline Stages
 
 The package lives under:
@@ -61,20 +197,21 @@ The split is intentional. These are the main data boundaries. More splitting is 
 
 ## Configuration
 
-Main config:
+Shared Gainr defaults and company profiles:
 
 ```text
 configs/pipeline.yaml
+configs/companies/*.yaml
 ```
 
-It contains:
+Profiles contain:
 
-- input/output paths
-- MySQL/phpMyAdmin reference metadata
-- source table names, CSV filenames, and primary keys
-- Postgres environment variable names
-- all 23 embedding source columns
-- BM25/filter candidate columns
+- adapter and company identity
+- isolated input/output paths
+- source backend, schema, table names, CSV filenames, and primary keys
+- company-specific credential variable names
+- destination database/schema/table metadata
+- embedding, BM25, filter, and output type rules
 
 Secrets are not stored in code. Use:
 
@@ -96,6 +233,39 @@ From the repo root:
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --run-all
 ```
 
+The command above defaults to `gainr`. The explicit equivalent is:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company gainr \
+  --run-all
+```
+
+Run every configured company independently:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --all-companies \
+  --run-all
+```
+
+Refresh every company using its own configured source backend, rebuild, and publish each successful result:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --all-companies \
+  --refresh-source configured \
+  --apply-source-refresh \
+  --run-all \
+  --publish
+```
+
+One company failing does not stop the others. The batch exits nonzero when any company fails and records the result in:
+
+```text
+output/reports/company_batch_report.json
+```
+
 For a fast sample:
 
 ```bash
@@ -105,15 +275,84 @@ PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
   --no-csv
 ```
 
-Run one stage:
+Run one shared stage:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline --stage attributes
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company gainr \
+  --stage normalize
 ```
 
-## Source Refresh Automation
+The legacy `category`, `location`, and `attributes` stage names remain available for the Gainr adapter.
 
-The pipeline can run from same-name CSV snapshots or from a real database export. The phpMyAdmin URL is only a browser reference; automated refresh should use direct MySQL/MariaDB or Postgres credentials in `.env`.
+## Add Another Company
+
+1. Put sanitized representative source files under `data/companies/<slug>/incoming/`.
+2. Copy `configs/companies/example-flat.yaml.example` to `configs/companies/<slug>.yaml`.
+3. Set `company.id`, source backend/schema/tables, paths, canonical column mapping, allowlisted `extra_columns`, filter columns, and destination settings.
+4. Create the profile's private env file, such as `.env.<slug>`, using namespaced variables.
+5. Run a sample and inspect that company's reports before enabling full or scheduled runs.
+
+For relational schemas with company-specific joins, add a Python adapter under `src/rag_ht_pipeline/adapters/` and register it in the adapter registry. Do not encode unverified multi-table relationships as YAML mappings.
+
+Example PostgreSQL extraction mapping:
+
+```yaml
+source:
+  backend: postgres
+  schema: inventory
+  host_env: ACME_SOURCE_POSTGRES_HOST
+  database_env: ACME_SOURCE_POSTGRES_DATABASE
+  user_env: ACME_SOURCE_POSTGRES_USER
+  password_env: ACME_SOURCE_POSTGRES_PASSWORD
+
+source_sync:
+  tables:
+    - name: products
+      db_schema: inventory
+      db_table: inventory_items
+      filename: products.csv
+      primary_key: product_code
+```
+
+Example validation run:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company <slug> \
+  --run-all \
+  --sample-size 1000 \
+  --no-csv
+```
+
+## Database Publishing
+
+Preprocessing never writes to a destination database unless publishing is explicitly requested.
+
+Validate the final artifact and destination settings without connecting or writing:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company <slug> \
+  --publish-dry-run
+```
+
+Build, validate, and atomically publish:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.pipeline \
+  --company <slug> \
+  --run-all \
+  --publish
+```
+
+Publishing loads a uniquely named staging table, verifies its row count, and promotes it to the configured final table. A failed preprocessing or validation run is never published. MySQL companies must use separate databases; PostgreSQL companies may use separate databases or schemas.
+
+## Gainr Source Refresh Automation
+
+The Gainr adapter can run from same-name CSV snapshots or from a real database export. The phpMyAdmin URL is only a browser reference; automated refresh should use direct MySQL/MariaDB or Postgres credentials in `.env`.
+
+`--refresh-source configured` reads `source.backend` from the selected company profile. Explicit `--refresh-source mysql` and `--refresh-source postgres` remain available as one-run overrides.
 
 The configured source tables are:
 
@@ -362,8 +601,10 @@ subcategory_meta_keywords
 `ads_search_ready` is the clean table intended for MySQL/search. It keeps only useful retrieval, display, and filter columns plus:
 
 ```text
+company_id
 embedding_content
 bm25_content
+extras_json
 ```
 
 It intentionally excludes wide/debug/source columns such as:
@@ -415,9 +656,9 @@ Schema mismatches from source data are not silently dropped. They are exported t
 output/diagnostics/ad_attribute_schema_mismatches.csv
 ```
 
-## MySQL Loading
+## Legacy Direct MySQL Loading
 
-If the production database is MySQL/MariaDB, load the clean search-ready snapshot into MySQL:
+The direct loader remains for Gainr compatibility and local troubleshooting. It does not provide the multi-company atomic staging/swap protection; use pipeline `--publish` for production.
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
@@ -438,9 +679,9 @@ PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
 Set credentials in `.env`:
 
 ```text
-MYSQL_HOST=testphpmyadmin.gainr.in
+MYSQL_HOST=localhost
 MYSQL_PORT=3306
-MYSQL_DATABASE=hvkbynbu_wwwdevsl_slowr_test
+MYSQL_DATABASE=gainr_catalog
 MYSQL_USER=
 MYSQL_PASSWORD=
 ```
@@ -458,9 +699,9 @@ PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.mysql_loader \
   --if-exists replace
 ```
 
-## Postgres Loading
+## Legacy Direct Postgres Loading
 
-Optional Postgres loader:
+The optional direct Postgres loader is also retained for compatibility:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m rag_ht_pipeline.postgres_loader \
@@ -489,9 +730,9 @@ POSTGRES_PASSWORD=
 MySQL source credentials also go in `.env`:
 
 ```text
-MYSQL_HOST=testphpmyadmin.gainr.in
+MYSQL_HOST=localhost
 MYSQL_PORT=3306
-MYSQL_DATABASE=hvkbynbu_wwwdevsl_slowr_test
+MYSQL_DATABASE=gainr_source
 MYSQL_USER=
 MYSQL_PASSWORD=
 ```

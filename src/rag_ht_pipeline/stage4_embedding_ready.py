@@ -50,7 +50,9 @@ def plain(row: pd.Series, columns: list[str]) -> str:
 
 
 def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool = False) -> dict[str, Any]:
-    df = pd.read_parquet(config.output.intermediate / "ads_stage_03_attributes_enriched.parquet")
+    input_path = config.output.intermediate / f"{config.artifact_prefix}_stage_03_attributes_enriched.parquet"
+    df = pd.read_parquet(input_path)
+    config.output.final.mkdir(parents=True, exist_ok=True)
     if sample_size is not None:
         df = df.head(sample_size).copy()
     missing = [c for c in config.embedding_source_columns if c not in df.columns]
@@ -65,8 +67,8 @@ def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool 
     )
     df["embedding_content_char_count"] = df["embedding_content"].str.len().fillna(0).astype(int)
     df["embedding_content_token_estimate"] = (df["embedding_content_char_count"] / 4).round().astype(int)
-    parquet = config.output.final / "ads_embedding_ready.parquet"
-    csv = config.output.final / "ads_embedding_ready.csv"
+    parquet = config.output.final / f"{config.artifact_prefix}_embedding_ready.parquet"
+    csv = config.output.final / f"{config.artifact_prefix}_embedding_ready.csv"
     df.to_parquet(parquet, index=False)
     if not no_csv:
         df.to_csv(csv, index=False)

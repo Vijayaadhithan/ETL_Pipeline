@@ -1,9 +1,12 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .ipynb_checkpoints/
 .env
+.env.*
+!.env.example
 notebooks/
 output_stage1_sample/
 output_stage2_sample/

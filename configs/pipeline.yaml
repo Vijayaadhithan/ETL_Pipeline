@@ -1,3 +1,8 @@
+company:
+  id: gainr
+  adapter: gainr
+  artifact_prefix: ads
+
 paths:
   input_dir: .
   data_dir: data
@@ -67,7 +72,25 @@ postgres:
   final_table: ads_search_ready
 
 search_ready:
+  types:
+    integer:
+      - id
+      - main_category_id
+      - subcategory_id
+      - state_id
+      - city_id
+      - locality_id
+    float:
+      - rental_fee
+      - city_latitude
+      - city_longitude
+      - locality_latitude
+      - locality_longitude
+    datetime:
+      - created_at
+      - updated_at
   columns:
+    - company_id
     - id
     - title
     - description
@@ -104,6 +127,7 @@ search_ready:
     - city_locality_consistency_status
     - embedding_content
     - bm25_content
+    - extras_json
 
 embedding:
   source_columns:

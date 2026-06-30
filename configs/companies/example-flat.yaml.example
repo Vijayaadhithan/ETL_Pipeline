@@ -1,0 +1,99 @@
+company:
+  id: acme
+  adapter: flat_catalog
+  artifact_prefix: catalog
+
+paths:
+  input_dir: data/companies/acme/incoming
+  data_dir: data/companies/acme/incoming
+  output_root: output/companies/acme
+  intermediate_dir: output/companies/acme/intermediate
+  final_dir: output/companies/acme/final
+  reports_dir: output/companies/acme/reports
+  diagnostics_dir: output/companies/acme/diagnostics
+
+source:
+  # Use csv for files already delivered locally, or mysql/postgres for DB extraction.
+  backend: postgres
+  schema: inventory
+  host_env: ACME_SOURCE_POSTGRES_HOST
+  port_env: ACME_SOURCE_POSTGRES_PORT
+  database_env: ACME_SOURCE_POSTGRES_DATABASE
+  user_env: ACME_SOURCE_POSTGRES_USER
+  password_env: ACME_SOURCE_POSTGRES_PASSWORD
+
+source_sync:
+  staging_dir: output/companies/acme/source_sync/latest
+  backup_dir: output/companies/acme/source_sync/backups
+  tables:
+    - name: products
+      db_schema: inventory
+      db_table: inventory_items
+      filename: products.csv
+      primary_key: product_code
+
+adapter_config:
+  filename: products.csv
+  # Only allowlisted fields are retained in extras_json.
+  extra_columns:
+    - manufacturer_part_number
+  # Canonical field -> source CSV field. Only id and title are mandatory.
+  column_map:
+    id: product_code
+    title: product_name
+    description: product_description
+    status: availability
+    main_category_name: department
+    subcategory_name: category
+    rental_fee: price
+
+embedding:
+  source_columns:
+    - title
+    - description
+    - main_category_name
+    - subcategory_name
+
+bm25:
+  source_columns:
+    - title
+    - description
+    - main_category_name
+    - subcategory_name
+    - brand
+
+search_ready:
+  types:
+    float:
+      - rental_fee
+  columns:
+    - company_id
+    - id
+    - title
+    - description
+    - status
+    - main_category_name
+    - subcategory_name
+    - rental_fee
+    - brand
+    - embedding_content
+    - bm25_content
+    - extras_json
+  filter_columns:
+    - status
+    - brand
+    - main_category_name
+    - subcategory_name
+
+credentials:
+  env_file: .env.acme
+
+destination:
+  backend: mysql
+  host_env: ACME_MYSQL_HOST
+  port_env: ACME_MYSQL_PORT
+  database_env: ACME_MYSQL_DATABASE
+  user_env: ACME_MYSQL_USER
+  password_env: ACME_MYSQL_PASSWORD
+  table: search_ready
+  schema: public

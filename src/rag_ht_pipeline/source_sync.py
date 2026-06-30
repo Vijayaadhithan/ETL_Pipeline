@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +13,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from .config import DEFAULT_CONFIG_PATH, PipelineConfig, ensure_output_dirs, load_config
-from .postgres_loader import load_env_file
+from .credentials import resolve_env_value
 from .stage1_category import NULL_VALUES
 
 
@@ -24,7 +23,7 @@ LOGGER = logging.getLogger("rag_ht_pipeline.source_sync")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refresh or inspect pipeline source CSV snapshots.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Pipeline YAML config.")
-    parser.add_argument("--source", choices=["csv", "mysql", "postgres"], default="csv")
+    parser.add_argument("--source", choices=["configured", "csv", "mysql", "postgres"], default="csv")
     parser.add_argument("--apply", action="store_true", help="Replace local source CSVs with the exported snapshot.")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--staging-dir", type=Path, default=None)
@@ -130,7 +129,10 @@ def compare_snapshots(
 def source_tables(config: PipelineConfig) -> list[dict[str, str]]:
     tables = config.source_sync.get("tables", [])
     if not tables:
-        raise RuntimeError("No source_sync.tables entries found in configs/pipeline.yaml.")
+        raise RuntimeError(
+            f"No source_sync.tables entries found for company {config.company_id!r} "
+            f"in {config.config_path}."
+        )
     return [dict(table) for table in tables]
 
 
@@ -155,32 +157,95 @@ def target_file(config: PipelineConfig, filename: str) -> Path:
     return config.input_dir / filename
 
 
-def env_value(env_name: str, *, default: str | None = None, required: bool = True) -> str:
-    value = os.environ.get(env_name, default)
-    if required and not value:
-        raise RuntimeError(f"Missing required environment variable: {env_name}")
-    return value or ""
+def configured_source_backend(config: PipelineConfig) -> str:
+    backend = str(config.source.get("backend", "csv")).lower()
+    if backend not in {"csv", "mysql", "postgres"}:
+        raise ValueError(
+            f"Unsupported source backend {backend!r} for company {config.company_id!r}; "
+            "expected csv, mysql, or postgres."
+        )
+    return backend
 
 
-def database_url(config: PipelineConfig, source: str) -> str:
+def resolve_source_backend(config: PipelineConfig, requested: str) -> str:
+    return configured_source_backend(config) if requested == "configured" else requested
+
+
+def source_connection_settings(config: PipelineConfig, source: str) -> dict[str, Any]:
+    legacy = config.mysql if source == "mysql" else config.postgres
+    configured = config.source if configured_source_backend(config) == source else {}
+    return {**legacy, **configured}
+
+
+def database_url(config: PipelineConfig, source: str, *, env_file: Path = Path(".env")) -> str:
+    settings = source_connection_settings(config, source)
+    context = f"{config.company_id!r} {source} source"
     if source == "mysql":
-        mysql = config.mysql
-        host = env_value(mysql.get("host_env", "MYSQL_HOST"), default="localhost")
-        port = env_value(mysql.get("port_env", "MYSQL_PORT"), default="3306", required=False) or "3306"
-        database = os.environ.get("MYSQL_DATABASE") or mysql.get("database")
-        if not database:
-            raise RuntimeError("MYSQL_DATABASE or mysql.database must be configured.")
-        user = env_value(mysql.get("user_env", "MYSQL_USER"))
-        password = env_value(mysql.get("password_env", "MYSQL_PASSWORD"))
-        return f"mysql+pymysql://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{database}"
+        host = resolve_env_value(
+            str(settings.get("host_env", "MYSQL_HOST")),
+            env_file=env_file,
+            default="localhost",
+            context=context,
+        )
+        port = resolve_env_value(
+            str(settings.get("port_env", "MYSQL_PORT")),
+            env_file=env_file,
+            default="3306",
+            context=context,
+        )
+        database = resolve_env_value(
+            str(settings.get("database_env", "MYSQL_DATABASE")),
+            env_file=env_file,
+            default=settings.get("database"),
+            context=context,
+        )
+        user = resolve_env_value(
+            str(settings.get("user_env", "MYSQL_USER")),
+            env_file=env_file,
+            context=context,
+        )
+        password = resolve_env_value(
+            str(settings.get("password_env", "MYSQL_PASSWORD")),
+            env_file=env_file,
+            context=context,
+        )
+        return (
+            f"mysql+pymysql://{quote_plus(user)}:{quote_plus(password)}@"
+            f"{host}:{port}/{quote_plus(database)}"
+        )
     if source == "postgres":
-        postgres = config.postgres
-        host = env_value(postgres.get("host_env", "POSTGRES_HOST"), default="localhost")
-        port = env_value(postgres.get("port_env", "POSTGRES_PORT"), default="5432", required=False) or "5432"
-        database = env_value(postgres.get("database_env", "POSTGRES_DATABASE"), default="rag_ht")
-        user = env_value(postgres.get("user_env", "POSTGRES_USER"))
-        password = env_value(postgres.get("password_env", "POSTGRES_PASSWORD"))
-        return f"postgresql+psycopg://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{database}"
+        host = resolve_env_value(
+            str(settings.get("host_env", "POSTGRES_HOST")),
+            env_file=env_file,
+            default="localhost",
+            context=context,
+        )
+        port = resolve_env_value(
+            str(settings.get("port_env", "POSTGRES_PORT")),
+            env_file=env_file,
+            default="5432",
+            context=context,
+        )
+        database = resolve_env_value(
+            str(settings.get("database_env", "POSTGRES_DATABASE")),
+            env_file=env_file,
+            default=settings.get("database", "rag_ht"),
+            context=context,
+        )
+        user = resolve_env_value(
+            str(settings.get("user_env", "POSTGRES_USER")),
+            env_file=env_file,
+            context=context,
+        )
+        password = resolve_env_value(
+            str(settings.get("password_env", "POSTGRES_PASSWORD")),
+            env_file=env_file,
+            context=context,
+        )
+        return (
+            f"postgresql+psycopg://{quote_plus(user)}:{quote_plus(password)}@"
+            f"{host}:{port}/{quote_plus(database)}"
+        )
     raise ValueError(f"Unsupported database source: {source}")
 
 
@@ -191,11 +256,26 @@ def quote_identifier(identifier: str, source: str) -> str:
     return f"{quote}{identifier}{quote}"
 
 
+def qualified_table_name(
+    table: dict[str, str],
+    source: str,
+    *,
+    default_schema: str | None = None,
+) -> str:
+    db_table = table["db_table"]
+    schema = table.get("db_schema") or default_schema
+    quoted_table = quote_identifier(db_table, source)
+    if not schema:
+        return quoted_table
+    return f"{quote_identifier(schema, source)}.{quoted_table}"
+
+
 def export_database_tables(
     config: PipelineConfig,
     *,
     source: str,
     staging_dir: Path,
+    env_file: Path = Path(".env"),
     sample_size: int | None = None,
 ) -> dict[str, Path]:
     try:
@@ -203,15 +283,17 @@ def export_database_tables(
     except ModuleNotFoundError as exc:
         raise RuntimeError("SQLAlchemy is required for database source sync. Install requirements.txt first.") from exc
 
-    engine = create_engine(database_url(config, source))
+    engine = create_engine(database_url(config, source, env_file=env_file))
     exported: dict[str, Path] = {}
     staging_dir.mkdir(parents=True, exist_ok=True)
     limit_clause = f" LIMIT {int(sample_size)}" if sample_size is not None else ""
+    default_schema = str(config.source.get("schema", "")).strip() or None
     for table in source_tables(config):
         db_table = table["db_table"]
         filename = table["filename"]
-        query = f"SELECT * FROM {quote_identifier(db_table, source)}{limit_clause}"
-        LOGGER.info("Exporting %s to %s", db_table, filename)
+        qualified_table = qualified_table_name(table, source, default_schema=default_schema)
+        query = f"SELECT * FROM {qualified_table}{limit_clause}"
+        LOGGER.info("Exporting %s to %s", qualified_table, filename)
         df = pd.read_sql_query(query, engine)
         path = staging_dir / filename
         df.to_csv(path, index=False)
@@ -253,6 +335,8 @@ def write_reports(config: PipelineConfig, report: dict[str, Any]) -> None:
         rows.append(
             {
                 "table": table_name,
+                "db_schema": table_report.get("db_schema"),
+                "db_table": table_report.get("db_table"),
                 "filename": table_report.get("filename"),
                 "current_rows": table_report.get("current_rows"),
                 "incoming_rows": table_report.get("incoming_rows"),
@@ -278,16 +362,23 @@ def run_source_sync(
     sample_size: int | None = None,
 ) -> dict[str, Any]:
     ensure_output_dirs(config)
-    load_env_file(env_file)
+    source = resolve_source_backend(config, source)
     staging_dir = staging_dir or configured_path(config, "staging_dir", "output/source_sync/latest")
     backup_dir = configured_path(config, "backup_dir", "output/source_sync/backups")
 
     exported: dict[str, Path] = {}
     if source in {"mysql", "postgres"}:
-        exported = export_database_tables(config, source=source, staging_dir=staging_dir, sample_size=sample_size)
+        exported = export_database_tables(
+            config,
+            source=source,
+            staging_dir=staging_dir,
+            env_file=env_file,
+            sample_size=sample_size,
+        )
 
     report: dict[str, Any] = {
         "source": source,
+        "source_schema": config.source.get("schema", ""),
         "applied": bool(apply),
         "sample_size": sample_size,
         "staging_dir": str(staging_dir),
@@ -304,6 +395,7 @@ def run_source_sync(
         table_report: dict[str, Any] = {
             "filename": filename,
             "db_table": table.get("db_table"),
+            "db_schema": table.get("db_schema") or config.source.get("schema", ""),
             "current_path": str(current_path) if current_path else "",
             "incoming_path": str(incoming_path) if incoming_path else "",
             "primary_key": primary_key,

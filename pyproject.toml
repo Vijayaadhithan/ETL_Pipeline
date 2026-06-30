@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rag-ht-pipeline"
 version = "0.1.0"
-description = "Rental marketplace CSV enrichment and embedding-ready data pipeline"
+description = "Isolated multi-company catalog enrichment and search-ready data pipeline"
 requires-python = ">=3.11"
 dependencies = [
   "pandas",
@@ -29,6 +29,10 @@ source-db = [
 dev = [
   "pytest",
 ]
+
+[project.scripts]
+rag-ht-pipeline = "rag_ht_pipeline.pipeline:main"
+rag-ht-source-sync = "rag_ht_pipeline.source_sync:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,0 +1,33 @@
+extends: ../pipeline.yaml
+
+company:
+  id: gainr
+  adapter: gainr
+  artifact_prefix: ads
+
+credentials:
+  env_file: .env
+
+source:
+  backend: mysql
+  host_env: MYSQL_HOST
+  port_env: MYSQL_PORT
+  database_env: MYSQL_DATABASE
+  user_env: MYSQL_USER
+  password_env: MYSQL_PASSWORD
+
+destination:
+  backend: mysql
+  database_env: MYSQL_DATABASE
+  table: ads_search_ready
+  schema: public
+
+search_ready:
+  filter_columns:
+    - status
+    - main_category_id
+    - subcategory_id
+    - state_id
+    - city_id
+    - locality_id
+    - rental_fee

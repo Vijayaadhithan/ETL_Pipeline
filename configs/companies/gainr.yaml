@@ -38,6 +38,8 @@ destination:
 
 search_ready:
   filter_columns:
+    - type
+    - is_rent_negotiable
     - status
     - main_category_id
     - subcategory_id

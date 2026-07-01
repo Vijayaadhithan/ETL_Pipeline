@@ -61,10 +61,12 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "attributes_text" in config.embedding_source_columns
     assert "attribute_values_text" in config.embedding_source_columns
     assert len(config.bm25_source_columns) == 21
-    assert len(config.search_ready_columns) == 38
+    assert len(config.search_ready_columns) == 40
     assert config.company_id == "gainr"
     assert config.adapter == "gainr"
     assert "company_id" in config.search_ready_columns
+    assert "type" in config.search_ready_columns
+    assert "is_rent_negotiable" in config.search_ready_columns
     assert "extras_json" in config.search_ready_columns
     assert "embedding_content" in config.search_ready_columns
     assert "bm25_content" in config.search_ready_columns
@@ -111,6 +113,8 @@ def test_search_ready_type_casts_numeric_and_datetime_columns() -> None:
         [
             {
                 "id": "10",
+                "type": "1",
+                "is_rent_negotiable": "0",
                 "city_id": "20",
                 "rental_fee": "1500.50",
                 "city_latitude": "13.0827",
@@ -125,6 +129,8 @@ def test_search_ready_type_casts_numeric_and_datetime_columns() -> None:
     typed = cast_search_ready_types(df)
 
     assert str(typed["id"].dtype) == "Int64"
+    assert str(typed["type"].dtype) == "Int64"
+    assert str(typed["is_rent_negotiable"].dtype) == "Int64"
     assert str(typed["city_id"].dtype) == "Int64"
     assert pd.api.types.is_float_dtype(typed["rental_fee"])
     assert pd.api.types.is_float_dtype(typed["city_latitude"])

@@ -28,7 +28,16 @@ REQUIRED_COLUMNS = {
     "bm25_content",
     "extras_json",
 }
-INTEGER_COLUMNS = {"id", "main_category_id", "subcategory_id", "state_id", "city_id", "locality_id"}
+INTEGER_COLUMNS = {
+    "id",
+    "type",
+    "is_rent_negotiable",
+    "main_category_id",
+    "subcategory_id",
+    "state_id",
+    "city_id",
+    "locality_id",
+}
 FLOAT_COLUMNS = {"rental_fee", "city_latitude", "city_longitude", "locality_latitude", "locality_longitude"}
 DATETIME_COLUMNS = {"created_at", "updated_at"}
 

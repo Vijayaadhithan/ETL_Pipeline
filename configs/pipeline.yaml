@@ -76,6 +76,8 @@ search_ready:
   types:
     integer:
       - id
+      - type
+      - is_rent_negotiable
       - main_category_id
       - subcategory_id
       - state_id
@@ -93,10 +95,12 @@ search_ready:
   columns:
     - company_id
     - id
+    - type
     - title
     - description
     - rental_duration
     - rental_fee
+    - is_rent_negotiable
     - status
     - created_at
     - updated_at

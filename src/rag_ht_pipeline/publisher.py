@@ -345,6 +345,40 @@ def _postgres_publish_file(
         connection.execute(text(f'ALTER TABLE "{schema}"."{staging}" RENAME TO "{table}"'))
 
 
+def _live_verification_sql(backend: str, *, table: str, schema: str) -> str:
+    if backend == "mysql":
+        return (
+            f"SELECT COUNT(*) AS row_count, COUNT(DISTINCT `id`) AS distinct_ids, "
+            f"SUM(CASE WHEN `company_id` <> :company_id THEN 1 ELSE 0 END) AS wrong_company "
+            f"FROM `{table}`"
+        )
+    return (
+        f'SELECT COUNT(*) AS row_count, COUNT(DISTINCT "id") AS distinct_ids, '
+        f'SUM(CASE WHEN "company_id" <> :company_id THEN 1 ELSE 0 END) AS wrong_company '
+        f'FROM "{schema}"."{table}"'
+    )
+
+
+def _restore_previous_mysql_table(connection: Any, *, table: str, backup: str) -> bool:
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(connection)
+    if not inspector.has_table(table) or not inspector.has_table(backup):
+        return False
+    failed = safe_identifier(
+        f"{table[:46]}__failed_{uuid4().hex[:8]}",
+        "failed publish table",
+    )
+    connection.execute(
+        text(
+            f"RENAME TABLE `{table}` TO `{failed}`, "
+            f"`{backup}` TO `{table}`"
+        )
+    )
+    connection.execute(text(f"DROP TABLE `{failed}`"))
+    return True
+
+
 def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[str, Any]:
     input_path = config.output.final / f"{config.artifact_prefix}_search_ready.parquet"
     if not input_path.exists():
@@ -407,27 +441,27 @@ def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[st
                     retain_previous=retain_previous,
                     indexes=indexes,
                 )
-            from sqlalchemy import inspect, text
+            from sqlalchemy import text
 
-            if backend == "mysql":
+            try:
                 live = connection.execute(
-                    text(
-                        f"SELECT COUNT(*) AS rows, COUNT(DISTINCT `id`) AS distinct_ids, "
-                        f"SUM(CASE WHEN `company_id` <> :company_id THEN 1 ELSE 0 END) AS wrong_company "
-                        f"FROM `{table}`"
-                    ),
+                    text(_live_verification_sql(backend, table=table, schema=schema)),
                     {"company_id": config.company_id},
                 ).mappings().one()
-            else:
-                live = connection.execute(
-                    text(
-                        f'SELECT COUNT(*) AS rows, COUNT(DISTINCT "id") AS distinct_ids, '
-                        f'SUM(CASE WHEN "company_id" <> :company_id THEN 1 ELSE 0 END) AS wrong_company '
-                        f'FROM "{schema}"."{table}"'
-                    ),
-                    {"company_id": config.company_id},
-                ).mappings().one()
-            live_rows = int(live["rows"])
+            except Exception:
+                if backend == "mysql" and retain_previous:
+                    restored = _restore_previous_mysql_table(
+                        connection,
+                        table=table,
+                        backup=backup,
+                    )
+                    if restored:
+                        LOGGER.error(
+                            "Post-publish verification errored; restored previous MySQL table %s.",
+                            table,
+                        )
+                raise
+            live_rows = int(live["row_count"])
             live_distinct = int(live["distinct_ids"])
             live_wrong_company = int(live["wrong_company"] or 0)
             if (
@@ -435,18 +469,12 @@ def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[st
                 or live_distinct != live_rows
                 or live_wrong_company
             ):
-                if backend == "mysql" and retain_previous and inspect(connection).has_table(backup):
-                    failed = safe_identifier(
-                        f"{table[:46]}__failed_{uuid4().hex[:8]}",
-                        "failed publish table",
+                if backend == "mysql" and retain_previous:
+                    _restore_previous_mysql_table(
+                        connection,
+                        table=table,
+                        backup=backup,
                     )
-                    connection.execute(
-                        text(
-                            f"RENAME TABLE `{table}` TO `{failed}`, "
-                            f"`{backup}` TO `{table}`"
-                        )
-                    )
-                    connection.execute(text(f"DROP TABLE `{failed}`"))
                 raise RuntimeError(
                     "Post-publish verification failed: "
                     f"expected_rows={validation['rows']}, live_rows={live_rows}, "

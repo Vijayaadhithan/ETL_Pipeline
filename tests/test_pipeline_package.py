@@ -31,7 +31,9 @@ from rag_ht_pipeline.pipeline import run_batch, validate_company_isolation  # no
 from rag_ht_pipeline.operations import preflight, run_status_path  # noqa: E402
 from rag_ht_pipeline.postgres_loader import read_input  # noqa: E402
 from rag_ht_pipeline.publisher import (  # noqa: E402
+    _live_verification_sql,
     _mysql_publish,
+    _restore_previous_mysql_table,
     credential_value,
     publish_company,
     validate_publish_file,
@@ -956,6 +958,44 @@ def test_mysql_publish_uses_one_atomic_swap_statement(monkeypatch) -> None:
         "`search_ready__staging_1234` TO `search_ready`"
     ]
     assert statements[-1] == "DROP TABLE `search_ready__backup_1234`"
+
+
+def test_live_verification_sql_uses_mariadb_safe_row_count_alias() -> None:
+    mysql = _live_verification_sql("mysql", table="search_ready", schema="public")
+    postgres = _live_verification_sql("postgres", table="search_ready", schema="catalog")
+
+    assert "AS row_count" in mysql
+    assert "AS rows" not in mysql
+    assert "FROM `search_ready`" in mysql
+    assert "AS row_count" in postgres
+    assert 'FROM "catalog"."search_ready"' in postgres
+
+
+def test_mysql_post_publish_verification_failure_restores_previous(monkeypatch) -> None:
+    statements: list[str] = []
+
+    class Connection:
+        def execute(self, statement: object) -> None:
+            statements.append(str(statement))
+
+    class Inspector:
+        def has_table(self, table: str) -> bool:
+            return table in {"search_ready", "search_ready__previous"}
+
+    monkeypatch.setattr("sqlalchemy.inspect", lambda connection: Inspector())
+
+    restored = _restore_previous_mysql_table(
+        Connection(),
+        table="search_ready",
+        backup="search_ready__previous",
+    )
+
+    assert restored is True
+    assert statements[0].startswith(
+        "RENAME TABLE `search_ready` TO `search_ready__failed_"
+    )
+    assert "`search_ready__previous` TO `search_ready`" in statements[0]
+    assert statements[1].startswith("DROP TABLE `search_ready__failed_")
 
 
 def test_batch_continues_after_company_failure(tmp_path: Path, monkeypatch) -> None:

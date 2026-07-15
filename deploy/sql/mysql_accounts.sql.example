@@ -1,0 +1,13 @@
+-- Run as a MySQL administrator after replacing host, database, and passwords.
+-- Prefer a dedicated destination database so the writer cannot modify sources.
+
+CREATE USER IF NOT EXISTS 'rag_ht_reader'@'ETL_SERVER_HOST'
+  IDENTIFIED BY 'REPLACE_WITH_SOURCE_READER_PASSWORD';
+GRANT SELECT ON `SOURCE_DATABASE`.* TO 'rag_ht_reader'@'ETL_SERVER_HOST';
+
+CREATE USER IF NOT EXISTS 'rag_ht_writer'@'ETL_SERVER_HOST'
+  IDENTIFIED BY 'REPLACE_WITH_DESTINATION_WRITER_PASSWORD';
+GRANT SELECT, INSERT, CREATE, DROP, ALTER, INDEX
+  ON `DESTINATION_DATABASE`.* TO 'rag_ht_writer'@'ETL_SERVER_HOST';
+
+FLUSH PRIVILEGES;

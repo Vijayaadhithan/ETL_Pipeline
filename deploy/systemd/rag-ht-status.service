@@ -1,0 +1,20 @@
+[Unit]
+Description=RAG HT aggregate multi-company ETL status endpoint
+After=network.target
+
+[Service]
+Type=simple
+User=raght
+Group=raght
+WorkingDirectory=/opt/rag-ht
+ExecStart=/opt/rag-ht/.venv/bin/rag-ht-status-server --all-companies --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/rag-ht
+
+[Install]
+WantedBy=multi-user.target

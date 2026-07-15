@@ -52,7 +52,7 @@ Run from the cloned repository:
 
 ```bash
 cd /path/to/ETL_Pipeline
-./scripts/setup.sh
+./scripts/setup.sh gainr
 ```
 
 The setup script:
@@ -68,7 +68,7 @@ The setup script:
 For a minimal production installation:
 
 ```bash
-./scripts/setup.sh --skip-tests
+./scripts/setup.sh gainr --skip-tests
 ```
 
 Verify the installation:
@@ -87,18 +87,43 @@ cp .env.example .env
 nano .env
 ```
 
-Gainr uses:
+Gainr deliberately uses two database accounts:
 
 ```text
-MYSQL_HOST=
-MYSQL_PORT=3306
-MYSQL_DATABASE=
-MYSQL_USER=
-MYSQL_PASSWORD=
+SOURCE_MYSQL_HOST=
+SOURCE_MYSQL_PORT=3306
+SOURCE_MYSQL_DATABASE=
+SOURCE_MYSQL_USER=        # SELECT-only account
+SOURCE_MYSQL_PASSWORD=
+
+DEST_MYSQL_HOST=
+DEST_MYSQL_PORT=3306
+DEST_MYSQL_DATABASE=
+DEST_MYSQL_USER=          # writer for ads_search_ready only
+DEST_MYSQL_PASSWORD=
 ```
 
-Never commit `.env`. Additional companies should use separate environment files
-and namespaced variables declared by their profile.
+Separate users are recommended in production for least privilege, but they are
+not required. A company may use the same database and user for both roles when
+that account has source `SELECT` plus destination table publish privileges.
+Never commit `.env`, and keep it owner-only:
+
+```bash
+chmod 600 .env
+```
+
+An administrator-ready account/grant template is available at
+`deploy/sql/mysql_accounts.sql.example`. Prefer a separate destination database;
+the writer needs table creation, indexing, atomic rename, and cleanup privileges
+there because publishing uses staging and retained-previous tables.
+
+Additional companies should use separate environment files and namespaced
+variables declared by their profile.
+
+To make separate source/destination users mandatory on a stricter deployment,
+set `operations.preflight.require_separate_database_users: true` in that
+company's profile. The shared default is `false`, so local and single-database
+company installations receive a warning instead of being blocked.
 
 ## Gainr Production Runbook
 
@@ -208,6 +233,14 @@ The source snapshots are still compared to detect updates and deletions.
 Publishing still loads the complete merged final artifact to preserve atomic
 table replacement.
 
+Before exporting a table, scheduled database refreshes compare a lightweight
+DB-side fingerprint (`COUNT`, maximum primary key, and maximum `updated_at`)
+with the last committed successful run. Unchanged tables are not downloaded.
+A mandatory full reconciliation runs at least every 24 hours to detect physical
+deletions or source systems that failed to advance `updated_at`. Fingerprint
+candidates are committed only after ETL succeeds, so a failed run cannot advance
+the extraction watermark.
+
 ## Scheduled Execution
 
 The guarded runner performs source refresh, incremental processing, validation,
@@ -243,6 +276,84 @@ tail -f output/reports/scheduled_gainr.log
 
 Omit `--publish` when the schedule should only create and validate local
 artifacts.
+
+### Recommended 4 GB server installation
+
+Production servers should use the provided systemd service and timer instead of
+calling the pipeline directly from cron. The unit has persistent scheduling,
+overlap protection, a four-hour timeout, process niceness, and 3/3.5 GB
+`MemoryHigh`/`MemoryMax` limits.
+
+Install the repository at `/opt/rag-ht`, create a locked-down `raght` service
+account, then run:
+
+```bash
+sudo ./scripts/install_systemd.sh gainr
+systemctl status rag-ht-etl@gainr.timer
+systemctl status rag-ht-status.service
+journalctl -u rag-ht-etl@gainr.service -f
+```
+
+Override the installation path when needed:
+
+```bash
+sudo RAG_HT_INSTALL_ROOT=/srv/rag-ht ./scripts/install_systemd.sh gainr
+```
+
+The timer runs hourly with a randomized delay. Missed timer executions run after
+the server comes back online.
+
+### Preflight, retry, and alerts
+
+Every scheduled execution now checks free disk, available memory, credential-file
+permissions, pending generations, and interrupted source-apply journals:
+
+```bash
+.venv/bin/rag-ht-ops preflight --company gainr
+```
+
+Transient database/network failures retry up to three times with exponential
+backoff. Validation and schema failures are not retried blindly. Configure one
+of these optional notification destinations in the service environment:
+
+```text
+RAG_HT_ALERT_WEBHOOK_URL=https://alerts.example/etl
+RAG_HT_ALERT_EMAIL=ops@example.com
+```
+
+The webhook receives JSON containing `company_id`, `severity`, `message`, and
+`sent_at`.
+
+### Status and health
+
+Inspect the latest run, validation, publish, and pending-generation state:
+
+```bash
+.venv/bin/rag-ht-ops status --company gainr
+curl http://127.0.0.1:8787/health
+curl http://127.0.0.1:8787/status
+curl http://127.0.0.1:8787/companies/gainr/health
+```
+
+The single status service discovers every installed company profile. `/health`
+and `/status` return an aggregate result; `/companies/<slug>/health` and
+`/companies/<slug>/status` return one isolated company result. This avoids port
+collisions when several companies run on one server. An endpoint returns HTTP
+503 for failed, unknown, or stale status. By default a status older than 26
+hours is stale. Each profile writes history and current status under its own
+configured `paths.reports_dir`.
+
+### Crash-safe resume
+
+Applied source changes are recorded in `pending_source_run.json` before ETL
+starts. If normalization, validation, or publishing fails, the next scheduled
+execution resumes that exact change set instead of comparing the already-applied
+snapshots and incorrectly reporting no changes.
+
+Source-table replacement has its own atomic apply journal. If the process is
+killed while files are being replaced, the next source sync restores the prior
+complete snapshot before extracting again. Staging exports are deleted only
+after the corresponding ETL generation succeeds.
 
 ## Monitoring a Running ETL
 
@@ -310,6 +421,10 @@ output/reports/incremental_run_report.json
 output/reports/pipeline_run_report.json
 output/reports/final_output_correctness_report.json
 output/reports/publish_report.json
+output/reports/run_status.json
+output/reports/run_history.jsonl
+output/reports/quality_baseline.json
+output/reports/streaming_verification_report.json
 ```
 
 `--no-csv` keeps Parquet intermediates and final artifacts while suppressing
@@ -324,6 +439,39 @@ output/source_sync/backups/
 Only the latest successful timestamped backup is retained. This cleanup does not
 affect company-managed database backups.
 
+## Data-quality Gates
+
+Publishing is blocked when canonical checks fail or configured quality metrics
+regress. Gainr currently enforces:
+
+- no duplicate or empty ad IDs
+- no empty embedding or BM25 content
+- no cross-company rows
+- category resolution at least 99%
+- city resolution at least 99%
+- locality resolution at least 90%
+- attribute mapping at least 85%
+- no row-count drop greater than 10% from the last accepted baseline
+- no join-ratio regression greater than five percentage points
+- no incremental source change greater than 50% without operator review
+
+Shared thresholds live under `quality` in `configs/base.yaml`; Gainr-specific
+resolution thresholds live in `configs/companies/gainr.yaml`. Successful
+validation updates `quality_baseline.json`; a failed gate prevents destination
+changes.
+
+## Publish Rollback
+
+Publishing retains one previous destination table and verifies the live row
+count after the atomic swap. Restore it without rebuilding ETL artifacts:
+
+```bash
+.venv/bin/rag-ht-pipeline --company gainr --rollback
+```
+
+Running rollback again swaps the two versions, so the action is reversible.
+The report is written to `output/reports/rollback_report.json`.
+
 ## Multi-Company Operation
 
 Company profiles live under:
@@ -331,6 +479,12 @@ Company profiles live under:
 ```text
 configs/companies/
 ```
+
+`configs/base.yaml` contains only shared operational defaults. Gainr's source
+tables, canonical columns, credentials, and destination settings live only in
+`configs/companies/gainr.yaml`. `configs/pipeline.yaml` remains a compatibility
+alias for older local Gainr commands; production automation should always use
+`--company <company-slug>`.
 
 Run one company:
 
@@ -356,12 +510,17 @@ company fails.
 
 To onboard a company:
 
-1. Add `configs/companies/<slug>.yaml`.
-2. Configure isolated source and destination credentials.
-3. Add or select the company adapter.
-4. Validate representative sanitized source samples.
-5. Complete a full baseline run.
-6. Enable incremental scheduling.
+1. Copy `configs/companies/example-flat.yaml.example` to
+   `configs/companies/<slug>.yaml` and keep `extends: ../base.yaml`.
+2. Set company-owned input, output, report, and source-sync paths.
+3. Create an isolated `.env.<slug>` file with mode `600`.
+4. Configure the company's read-only source user and separate restricted
+   destination writer.
+5. Add or select the company adapter for that company's schema.
+6. Validate representative sanitized source samples.
+7. Complete a full baseline run and publish dry-run.
+8. Enable the company's timer with
+   `sudo ./scripts/install_systemd.sh <slug>`.
 
 Use `configs/companies/example-flat.yaml.example` as a profile reference.
 
@@ -371,6 +530,13 @@ Run the test suite:
 
 ```bash
 .venv/bin/python -m pytest -q
+```
+
+Verify a complete streaming rebuild against the current baseline without loading
+both full datasets into memory:
+
+```bash
+.venv/bin/python scripts/verify_streaming_equivalence.py
 ```
 
 Run a small local verification without publishing:

@@ -1,20 +1,72 @@
-extends: ../pipeline.yaml
+extends: ../base.yaml
 
 company:
   id: gainr
   adapter: gainr
   artifact_prefix: ads
 
+paths:
+  input_dir: .
+  data_dir: data
+  output_root: output
+  intermediate_dir: output/intermediate
+  final_dir: output/final
+  reports_dir: output/reports
+  diagnostics_dir: output/diagnostics
+
 credentials:
   env_file: .env
 
 source:
   backend: mysql
-  host_env: MYSQL_HOST
-  port_env: MYSQL_PORT
-  database_env: MYSQL_DATABASE
-  user_env: MYSQL_USER
-  password_env: MYSQL_PASSWORD
+  host_env: SOURCE_MYSQL_HOST
+  port_env: SOURCE_MYSQL_PORT
+  database_env: SOURCE_MYSQL_DATABASE
+  user_env: SOURCE_MYSQL_USER
+  password_env: SOURCE_MYSQL_PASSWORD
+
+source_sync:
+  staging_dir: output/source_sync/latest
+  backup_dir: output/source_sync/backups
+  tables:
+    - name: ads
+      db_table: ads
+      filename: ads.csv
+      primary_key: id
+    - name: ads_attributes
+      db_table: ads_attributes
+      filename: ads_attributes.csv
+      primary_key: id
+    - name: categories
+      db_table: categories
+      filename: categories.csv
+      primary_key: id
+    - name: sub_categories
+      db_table: sub_categories
+      filename: sub_categories.csv
+      primary_key: id
+    - name: attributes
+      db_table: attributes
+      filename: attributes.csv
+      primary_key: id
+    - name: attribute_values
+      db_table: attribute_values
+      filename: attribute_values.csv
+      primary_key: id
+    - name: states
+      db_table: states
+      filename: states.csv
+      primary_key: id
+    - name: location
+      db_table: location
+      filename: location.csv
+      primary_key: id
+      updated_at_column: ""
+      force_export: true
+    - name: locations
+      db_table: locations
+      filename: locations.csv
+      primary_key: id
 
 incremental:
   record_table: ads
@@ -32,11 +84,100 @@ incremental:
 
 destination:
   backend: mysql
-  database_env: MYSQL_DATABASE
+  host_env: DEST_MYSQL_HOST
+  port_env: DEST_MYSQL_PORT
+  database_env: DEST_MYSQL_DATABASE
+  user_env: DEST_MYSQL_USER
+  password_env: DEST_MYSQL_PASSWORD
   table: ads_search_ready
   schema: public
+  retain_previous_table: true
+  indexes:
+    - [id]
+    - [main_category_id]
+    - [subcategory_id]
+    - [state_id]
+    - [city_id]
+    - [locality_id]
+    - [rental_fee]
+
+# Legacy loader settings retained only for Gainr-specific utility commands.
+mysql:
+  host_env: MYSQL_HOST
+  port_env: MYSQL_PORT
+  database_env: MYSQL_DATABASE
+  user_env: MYSQL_USER
+  password_env: MYSQL_PASSWORD
+
+postgres:
+  host_env: POSTGRES_HOST
+  port_env: POSTGRES_PORT
+  database_env: POSTGRES_DATABASE
+  user_env: POSTGRES_USER
+  password_env: POSTGRES_PASSWORD
+  final_table: ads_search_ready
 
 search_ready:
+  types:
+    integer:
+      - id
+      - type
+      - is_rent_negotiable
+      - main_category_id
+      - subcategory_id
+      - state_id
+      - city_id
+      - locality_id
+    float:
+      - rental_fee
+      - city_latitude
+      - city_longitude
+      - locality_latitude
+      - locality_longitude
+    datetime:
+      - created_at
+      - updated_at
+  columns:
+    - company_id
+    - id
+    - type
+    - title
+    - description
+    - rental_duration
+    - rental_fee
+    - is_rent_negotiable
+    - status
+    - created_at
+    - updated_at
+    - main_category_id
+    - main_category_name
+    - subcategory_id
+    - subcategory_name
+    - state_id
+    - state_name
+    - city_id
+    - city_name
+    - locality_id
+    - locality_name
+    - locality_district
+    - locality_pincode
+    - city_latitude
+    - city_longitude
+    - locality_latitude
+    - locality_longitude
+    - attributes_text
+    - attribute_values_text
+    - attribute_keywords_text
+    - attributes_json
+    - attribute_ids_json
+    - attribute_value_ids_json
+    - category_join_status
+    - location_join_status
+    - attribute_mapping_status
+    - city_locality_consistency_status
+    - embedding_content
+    - bm25_content
+    - extras_json
   filter_columns:
     - type
     - is_rent_negotiable
@@ -47,3 +188,59 @@ search_ready:
     - city_id
     - locality_id
     - rental_fee
+
+embedding:
+  source_columns:
+    - title
+    - description
+    - meta_title
+    - meta_description
+    - keywords
+    - custom_cat_value
+    - main_category_name
+    - main_category_meta_title
+    - main_category_meta_description
+    - subcategory_name
+    - subcategory_meta_title
+    - subcategory_meta_description
+    - rental_duration
+    - state_name
+    - city_name
+    - locality_name
+    - locality_district
+    - attributes_text
+    - attribute_values_text
+    - attribute_keywords_text
+    - meta_keywords
+    - main_category_meta_keywords
+    - subcategory_meta_keywords
+
+bm25:
+  source_columns:
+    - id
+    - title
+    - keywords
+    - meta_keywords
+    - custom_cat_value
+    - main_category_name
+    - main_category_meta_keywords
+    - main_category_ad_title_label
+    - main_category_placeholder
+    - subcategory_name
+    - subcategory_meta_keywords
+    - rental_duration
+    - main_category_rental_duration
+    - rental_fee
+    - state_name
+    - city_name
+    - locality_name
+    - locality_district
+    - attributes_text
+    - attribute_values_text
+    - attribute_keywords_text
+
+quality:
+  min_category_resolution_ratio: 0.99
+  min_city_resolution_ratio: 0.99
+  min_locality_resolution_ratio: 0.90
+  min_attribute_mapping_ratio: 0.85

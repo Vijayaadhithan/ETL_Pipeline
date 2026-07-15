@@ -1,0 +1,26 @@
+# Shared defaults only. Company schemas, tables, credentials, and output paths
+# belong in configs/companies/<company>.yaml.
+source_sync:
+  backup_retention: 1
+  export_batch_size: 25000
+  cleanup_staging_after_success: true
+  fingerprint:
+    enabled: true
+    updated_at_column: updated_at
+    force_full_after_hours: 24
+
+quality:
+  max_source_change_fraction: 0.50
+  source_change_gate_min_rows: 1000
+  max_row_drop_fraction: 0.10
+  max_ratio_regression: 0.05
+
+operations:
+  alert_webhook_env: RAG_HT_ALERT_WEBHOOK_URL
+  max_status_age_hours: 26
+  preflight:
+    min_free_disk_mb: 2048
+    min_available_memory_mb: 256
+    # Optional production hardening. Keep false when one company DB/user owns
+    # both the source tables and the generated destination table.
+    require_separate_database_users: false

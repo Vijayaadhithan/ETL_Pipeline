@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly RAG HT ETL pipeline for %i
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+Unit=rag-ht-etl@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -29,8 +31,9 @@ from .incremental import (
     missing_incremental_baselines,
     prepare_merged_artifacts,
 )
-from .publisher import credential_value, publish_company
+from .publisher import credential_value, publish_company, rollback_company
 from .publisher import validate_publish_file
+from .operations import finish_run, start_run, update_run, utc_now
 from .validation import run_final_verification
 
 
@@ -97,6 +100,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate publish configuration and final data without connecting or writing.",
     )
+    publishing.add_argument(
+        "--rollback",
+        action="store_true",
+        help="Atomically swap the retained previous destination table back into service.",
+    )
     args = parser.parse_args()
     if args.config and args.all_companies:
         parser.error("--config cannot be combined with --all-companies.")
@@ -122,6 +130,8 @@ def configure_logging() -> None:
 
 def write_pipeline_report(config: PipelineConfig, reports: dict[str, Any]) -> Path:
     payload = {
+        "status": "PASS",
+        "generated_at": utc_now(),
         "company_id": config.company_id,
         "adapter": config.adapter,
         "config": str(config.config_path),
@@ -229,12 +239,34 @@ def run_incremental_update(
 def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> dict[str, Any]:
     ensure_output_dirs(config)
     adapter = get_adapter(config.adapter)
-    publish_only = (args.publish or args.publish_dry_run) and not args.run_all and not args.stage
+    publish_only = (args.publish or args.publish_dry_run or args.rollback) and not args.run_all and not args.stage
     stages = [] if publish_only else (SHARED_STAGE_ORDER if args.run_all or not args.stage else args.stage)
     reports: dict[str, Any] = {}
 
+    if args.rollback:
+        update_run(config, stage="rollback")
+        reports["rollback"] = rollback_company(config)
+        write_pipeline_report(config, reports)
+        return reports
+
     source_sync_report: dict[str, Any] | None = None
-    if args.refresh_source:
+    pending_source = source_sync.load_pending_source_run(config) if args.incremental else None
+    if pending_source and pending_source.get("applied"):
+        LOGGER.warning(
+            "[%s] resuming pending source generation %s",
+            config.company_id,
+            pending_source.get("run_id"),
+        )
+        update_run(config, stage="resume-pending-source", pending_source_run=pending_source)
+        source_sync_report = {
+            "resumed": True,
+            "incremental": {
+                "change_set_path": pending_source["change_set_path"],
+            },
+        }
+        reports["source-sync-resume"] = pending_source
+    elif args.refresh_source:
+        update_run(config, stage="source-sync")
         resolved_source = source_sync.resolve_source_backend(config, args.refresh_source)
         LOGGER.info(
             "[%s] refreshing source snapshots from %s",
@@ -264,6 +296,10 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
             )
         missing_baselines = missing_incremental_baselines(config)
         source_mode = change_set["mode"]
+        if source_mode == "invalid":
+            raise RuntimeError(
+                f"Source refresh failed safety checks: {change_set['reason']}"
+            )
         if source_mode == "incremental" and not missing_baselines:
             reports["incremental"] = run_incremental_update(
                 config,
@@ -296,6 +332,7 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
             LOGGER.info("[%s] incremental fallback: %s", config.company_id, reason)
 
     for stage in stages:
+        update_run(config, stage=stage)
         LOGGER.info("[%s] running stage: %s", config.company_id, stage)
         stage_started = perf_counter()
         if stage == "normalize":
@@ -339,11 +376,20 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
         )
 
     if args.publish or args.publish_dry_run:
+        update_run(config, stage="publish-dry-run" if args.publish_dry_run else "publish")
         validation = reports.get("validate") or run_final_verification(config, sample_size=args.sample_size)
         reports["validate"] = validation
         if validation["status"] != "PASS":
             raise RuntimeError(f"Publishing blocked by failed validation for company {config.company_id!r}.")
         reports["publish"] = publish_company(config, dry_run=args.publish_dry_run and not args.publish)
+
+    if args.incremental:
+        reports["source-fingerprints-committed"] = source_sync.commit_source_fingerprints(config)
+        source_sync.clear_pending_source_run(config)
+        reports["source-staging-cleanup"] = {
+            "removed": source_sync.cleanup_source_staging(config),
+        }
+        shutil.rmtree(config.output.root / "incremental" / "work", ignore_errors=True)
 
     publish_final_aliases(config)
     organize_stage_artifacts(config)
@@ -441,7 +487,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     configs = selected_configs(args)
-    if len(configs) > 1 and (getattr(args, "publish", False) or getattr(args, "publish_dry_run", False)):
+    if len(configs) > 1 and (
+        getattr(args, "publish", False)
+        or getattr(args, "publish_dry_run", False)
+        or getattr(args, "rollback", False)
+    ):
         validate_resolved_destination_isolation(configs)
     started = datetime.now(timezone.utc)
     result: dict[str, Any] = {
@@ -451,6 +501,7 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "companies": {},
     }
     for config in configs:
+        start_run(config, command=sys.argv)
         try:
             reports = run_company_pipeline(args, config)
             result["companies"][config.company_id] = {
@@ -458,6 +509,14 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any]:
                 "adapter": config.adapter,
                 "reports": reports,
             }
+            finish_run(
+                config,
+                status="PASS",
+                summary={
+                    "incremental": reports.get("incremental", {}),
+                    "publish": reports.get("publish", {}),
+                },
+            )
         except Exception as exc:
             LOGGER.exception("[%s] pipeline failed", config.company_id)
             result["status"] = "FAIL"
@@ -467,6 +526,7 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any]:
                 "error_type": type(exc).__name__,
                 "error": str(exc),
             }
+            finish_run(config, status="FAIL", error=exc)
     result["finished_at"] = datetime.now(timezone.utc).isoformat()
     batch_report = Path.cwd() / "output" / "reports" / "company_batch_report.json"
     batch_report.parent.mkdir(parents=True, exist_ok=True)

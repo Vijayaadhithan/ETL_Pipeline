@@ -1,0 +1,24 @@
+[Unit]
+Description=RAG HT ETL pipeline for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=raght
+Group=raght
+WorkingDirectory=/opt/rag-ht
+ExecStart=/opt/rag-ht/scripts/run_scheduled_etl.sh %i --publish
+Nice=5
+MemoryHigh=3G
+MemoryMax=3500M
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/rag-ht
+TimeoutStartSec=4h
+
+[Install]
+WantedBy=multi-user.target

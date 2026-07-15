@@ -5,19 +5,24 @@ import hashlib
 import json
 import logging
 import shutil
+import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
+from uuid import uuid4
 
 import pandas as pd
 
 from .config import DEFAULT_CONFIG_PATH, PipelineConfig, ensure_output_dirs, load_config
 from .credentials import resolve_env_value
+from .operations import atomic_write_json, read_json, utc_now
 from .stage1_category import NULL_VALUES
 
 
 LOGGER = logging.getLogger("rag_ht_pipeline.source_sync")
+SOURCE_EXPORT_BATCH_SIZE = 25_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,6 +156,136 @@ def compare_snapshot_changes(
         }
     )
     return report, changes
+
+
+def compare_csv_snapshot_changes(
+    current_path: Path | None,
+    incoming_path: Path,
+    *,
+    primary_key: str,
+    record_key: str | None = None,
+    sample_limit: int = 20,
+) -> tuple[dict[str, Any], dict[str, set[str]]]:
+    """Compare large CSV snapshots with bounded memory using a temporary SQLite index."""
+    incoming_columns = list(pd.read_csv(incoming_path, nrows=0).columns)
+    current_columns = list(pd.read_csv(current_path, nrows=0).columns) if current_path else []
+    primary_available = primary_key in incoming_columns and (
+        current_path is None or primary_key in current_columns
+    )
+    report: dict[str, Any] = {
+        "current_rows": 0,
+        "incoming_rows": 0,
+        "row_delta": 0,
+        "primary_key": primary_key,
+        "primary_key_available": primary_available,
+        "current_duplicate_key_rows": 0,
+        "incoming_duplicate_key_rows": 0,
+        "added_rows": None,
+        "removed_rows": None,
+        "updated_rows": None,
+        "sample_added_keys": [],
+        "sample_removed_keys": [],
+        "sample_updated_keys": [],
+        "current_columns": current_columns,
+        "incoming_columns": incoming_columns,
+        "added_columns": sorted(set(incoming_columns) - set(current_columns)) if current_path else [],
+        "removed_columns": sorted(set(current_columns) - set(incoming_columns)) if current_path else [],
+    }
+    changes = {"added": set(), "removed": set(), "updated": set()}
+    if not primary_available:
+        return report, changes
+    common_columns = sorted(set(incoming_columns) & set(current_columns)) if current_path else incoming_columns
+    with tempfile.TemporaryDirectory(prefix="rag-ht-compare-") as directory:
+        database = sqlite3.connect(Path(directory) / "snapshot.sqlite")
+        try:
+            for side in ("current", "incoming"):
+                database.execute(
+                    f"CREATE TABLE {side} (key TEXT PRIMARY KEY, row_hash TEXT NOT NULL, record_key TEXT, occurrences INTEGER NOT NULL)"
+                )
+
+            def load(side: str, path: Path | None) -> int:
+                if path is None:
+                    return 0
+                rows = 0
+                for chunk in pd.read_csv(
+                    path,
+                    dtype="string",
+                    keep_default_na=True,
+                    na_values=NULL_VALUES,
+                    chunksize=SOURCE_EXPORT_BATCH_SIZE,
+                    low_memory=False,
+                ):
+                    rows += len(chunk)
+                    keys = chunk[primary_key].map(clean_key)
+                    hashes = row_hashes(chunk, common_columns)
+                    parents = (
+                        chunk[record_key].map(clean_key)
+                        if record_key and record_key in chunk.columns
+                        else pd.Series([""] * len(chunk), index=chunk.index)
+                    )
+                    database.executemany(
+                        f"INSERT INTO {side}(key,row_hash,record_key,occurrences) VALUES(?,?,?,1) "
+                        f"ON CONFLICT(key) DO UPDATE SET row_hash=excluded.row_hash, "
+                        f"record_key=excluded.record_key, occurrences={side}.occurrences+1",
+                        (
+                            (key_value, hash_value, parent)
+                            for key_value, hash_value, parent in zip(keys, hashes, parents, strict=False)
+                            if key_value
+                        ),
+                    )
+                    database.commit()
+                return rows
+
+            current_rows = load("current", current_path)
+            incoming_rows = load("incoming", incoming_path)
+            report["current_rows"] = current_rows
+            report["incoming_rows"] = incoming_rows
+            report["row_delta"] = incoming_rows - current_rows
+            for side in ("current", "incoming"):
+                report[f"{side}_duplicate_key_rows"] = int(
+                    database.execute(
+                        f"SELECT COALESCE(SUM(occurrences),0) FROM {side} WHERE occurrences > 1"
+                    ).fetchone()[0]
+                )
+            if current_path is None:
+                report["added_rows"] = incoming_rows
+                report["removed_rows"] = 0
+                report["updated_rows"] = 0
+                report["sample_added_keys"] = [
+                    row[0] for row in database.execute("SELECT key FROM incoming ORDER BY key LIMIT ?", (sample_limit,))
+                ]
+                return report, changes
+            queries = {
+                "added": "SELECT i.key FROM incoming i LEFT JOIN current c ON c.key=i.key WHERE c.key IS NULL",
+                "removed": "SELECT c.key FROM current c LEFT JOIN incoming i ON i.key=c.key WHERE i.key IS NULL",
+                "updated": "SELECT i.key FROM incoming i JOIN current c ON c.key=i.key WHERE i.row_hash<>c.row_hash",
+            }
+            for kind, query in queries.items():
+                values = {row[0] for row in database.execute(query)}
+                changes[kind] = values
+                report[f"{kind}_rows"] = len(values)
+                report[f"sample_{kind}_keys"] = sorted(values)[:sample_limit]
+        finally:
+            database.close()
+    return report, changes
+
+
+def related_record_ids_csv(
+    path: Path | None,
+    *,
+    primary_key: str,
+    row_keys: set[str],
+    record_key: str,
+) -> set[str]:
+    if path is None or not row_keys:
+        return set()
+    values: set[str] = set()
+    for chunk in pd.read_csv(path, dtype="string", chunksize=SOURCE_EXPORT_BATCH_SIZE, low_memory=False):
+        if primary_key not in chunk or record_key not in chunk:
+            return set()
+        selected = chunk.loc[chunk[primary_key].map(clean_key).isin(row_keys), record_key]
+        values.update(value for value in selected.map(clean_key) if value)
+    return values
 
 
 def related_record_ids(
@@ -328,20 +463,188 @@ def export_database_tables(
 
     engine = create_engine(database_url(config, source, env_file=env_file))
     exported: dict[str, Path] = {}
+    export_batch_size = int(config.source_sync.get("export_batch_size", SOURCE_EXPORT_BATCH_SIZE))
     staging_dir.mkdir(parents=True, exist_ok=True)
     limit_clause = f" LIMIT {int(sample_size)}" if sample_size is not None else ""
     default_schema = str(config.source.get("schema", "")).strip() or None
+    fingerprint_settings = dict(config.source_sync.get("fingerprint", {}))
+    fingerprint_enabled = bool(fingerprint_settings.get("enabled", False)) and sample_size is None
+    fingerprint_state_path = config.output.reports / "source_fingerprints.json"
+    fingerprint_candidate_path = config.output.reports / "source_fingerprints_candidate.json"
+    fingerprint_state = read_json(fingerprint_state_path) or {}
+    previous_fingerprints = dict(fingerprint_state.get("tables", {}))
+    force_full_hours = float(fingerprint_settings.get("force_full_after_hours", 24))
+    last_full_value = fingerprint_state.get("last_full_reconciliation_at")
+    force_full = True
+    if last_full_value:
+        try:
+            last_full = datetime.fromisoformat(str(last_full_value).replace("Z", "+00:00"))
+            force_full = (
+                datetime.now(timezone.utc) - last_full.astimezone(timezone.utc)
+            ).total_seconds() >= force_full_hours * 3600
+        except ValueError:
+            force_full = True
+    candidate_fingerprints: dict[str, Any] = {}
     for table in source_tables(config):
         db_table = table["db_table"]
         filename = table["filename"]
         qualified_table = qualified_table_name(table, source, default_schema=default_schema)
+        if fingerprint_enabled:
+            updated_column = str(table.get("updated_at_column", fingerprint_settings.get("updated_at_column", "updated_at")))
+            updated_expression = (
+                f"MAX({quote_identifier(updated_column, source)})"
+                if updated_column
+                else "''"
+            )
+            fingerprint_query = (
+                f"SELECT COUNT(*) AS row_count, MAX({quote_identifier(primary_key := table.get('primary_key', 'id'), source)}) AS max_key, "
+                f"{updated_expression} AS max_updated_at FROM {qualified_table}"
+            )
+            with engine.connect() as connection:
+                row = connection.exec_driver_sql(fingerprint_query).mappings().one()
+            fingerprint = {
+                "row_count": int(row["row_count"]),
+                "max_key": str(row["max_key"] or ""),
+                "max_updated_at": str(row["max_updated_at"] or ""),
+            }
+            candidate_fingerprints[table["name"]] = fingerprint
+            active = find_current_file(config, filename)
+            if (
+                not force_full
+                and not bool(table.get("force_export", False))
+                and active is not None
+                and previous_fingerprints.get(table["name"]) == fingerprint
+            ):
+                LOGGER.info("Skipping unchanged table %s using DB fingerprint", qualified_table)
+                continue
         query = f"SELECT * FROM {qualified_table}{limit_clause}"
         LOGGER.info("Exporting %s to %s", qualified_table, filename)
-        df = pd.read_sql_query(query, engine)
         path = staging_dir / filename
-        df.to_csv(path, index=False)
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        temporary.unlink(missing_ok=True)
+        rows_written = 0
+        header = True
+        for chunk in pd.read_sql_query(
+            query,
+            engine,
+            chunksize=export_batch_size,
+        ):
+            chunk.to_csv(
+                temporary,
+                mode="w" if header else "a",
+                header=header,
+                index=False,
+            )
+            header = False
+            rows_written += len(chunk)
+            LOGGER.info(
+                "Exported %s rows from %s (total=%s)",
+                len(chunk),
+                qualified_table,
+                rows_written,
+            )
+        if header:
+            pd.read_sql_query(
+                f"SELECT * FROM {qualified_table} WHERE 1=0",
+                engine,
+            ).to_csv(temporary, index=False)
+        temporary.replace(path)
         exported[filename] = path
+    if fingerprint_enabled:
+        atomic_write_json(
+            fingerprint_candidate_path,
+            {
+                "generated_at": utc_now(),
+                "source": source,
+                "force_full_reconciliation": force_full,
+                "tables": candidate_fingerprints,
+            },
+        )
     return exported
+
+
+def commit_source_fingerprints(config: PipelineConfig) -> bool:
+    candidate_path = config.output.reports / "source_fingerprints_candidate.json"
+    candidate = read_json(candidate_path)
+    if not candidate:
+        return False
+    previous = read_json(config.output.reports / "source_fingerprints.json") or {}
+    candidate["committed_at"] = utc_now()
+    if candidate.get("force_full_reconciliation"):
+        candidate["last_full_reconciliation_at"] = utc_now()
+    else:
+        candidate["last_full_reconciliation_at"] = previous.get(
+            "last_full_reconciliation_at",
+            utc_now(),
+        )
+    atomic_write_json(config.output.reports / "source_fingerprints.json", candidate)
+    candidate_path.unlink(missing_ok=True)
+    return True
+
+
+def pending_source_path(config: PipelineConfig) -> Path:
+    return config.output.reports / "pending_source_run.json"
+
+
+def source_apply_journal_path(config: PipelineConfig) -> Path:
+    return config.output.root / "source_sync" / "apply_journal.json"
+
+
+def load_pending_source_run(config: PipelineConfig) -> dict[str, Any] | None:
+    return read_json(pending_source_path(config))
+
+
+def clear_pending_source_run(config: PipelineConfig) -> None:
+    pending_source_path(config).unlink(missing_ok=True)
+
+
+def cleanup_source_staging(config: PipelineConfig) -> list[str]:
+    if not bool(config.source_sync.get("cleanup_staging_after_success", True)):
+        return []
+    staging = configured_path(config, "staging_dir", "output/source_sync/latest")
+    removed: list[str] = []
+    for table in source_tables(config):
+        path = staging / table["filename"]
+        active = target_file(config, table["filename"])
+        if path.exists() and path.resolve() != active.resolve():
+            path.unlink()
+            removed.append(str(path))
+    return removed
+
+
+def recover_incomplete_source_apply(config: PipelineConfig) -> dict[str, Any] | None:
+    journal_path = source_apply_journal_path(config)
+    journal = read_json(journal_path)
+    if not journal:
+        return None
+    pending = load_pending_source_run(config)
+    if journal.get("status") == "complete" and pending and pending.get("applied"):
+        journal_path.unlink(missing_ok=True)
+        return {"status": "complete_journal_removed"}
+    restored: list[str] = []
+    removed: list[str] = []
+    for action in journal.get("actions", []):
+        destination = Path(action["destination"])
+        backup_value = str(action.get("backup", ""))
+        backup = Path(backup_value) if backup_value else None
+        temporary_value = str(action.get("temporary", ""))
+        if backup is not None and backup.exists():
+            restore_temp = destination.with_name(f".{destination.name}.restore.{uuid4().hex}.tmp")
+            shutil.copy2(backup, restore_temp)
+            restore_temp.replace(destination)
+            restored.append(str(destination))
+        elif action.get("applied") and destination.exists():
+            destination.unlink()
+            removed.append(str(destination))
+        if temporary_value:
+            Path(temporary_value).unlink(missing_ok=True)
+    journal_path.unlink(missing_ok=True)
+    pending_source_path(config).unlink(missing_ok=True)
+    return {
+        "status": "rolled_back",
+        "restored": restored,
+        "removed": removed,
+    }
 
 
 def prune_backup_runs(
@@ -387,23 +690,50 @@ def backup_and_apply(
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_root = backup_dir / timestamp
     actions: list[dict[str, str]] = []
+    run_id = uuid4().hex
+    journal_path = source_apply_journal_path(config)
+    for table in source_tables(config):
+        filename = table["filename"]
+        current = find_current_file(config, filename)
+        if current is not None and current.exists():
+            backup_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(current, backup_root / filename)
     for filename, incoming_path in exported.items():
         destination = target_file(config, filename)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            backup_root.mkdir(parents=True, exist_ok=True)
-            backup_path = backup_root / filename
-            shutil.copy2(destination, backup_path)
-        else:
-            backup_path = Path("")
-        shutil.copy2(incoming_path, destination)
+        backup_path = backup_root / filename if (backup_root / filename).exists() else Path("")
+        temporary = destination.with_name(f".{destination.name}.{run_id}.tmp")
         actions.append(
             {
                 "filename": filename,
+                "incoming": str(incoming_path),
                 "destination": str(destination),
                 "backup": str(backup_path) if str(backup_path) else "",
+                "temporary": str(temporary),
+                "applied": False,
             }
         )
+    journal = {
+        "run_id": run_id,
+        "company_id": config.company_id,
+        "status": "applying",
+        "started_at": utc_now(),
+        "actions": actions,
+    }
+    atomic_write_json(journal_path, journal)
+    for index, action in enumerate(actions):
+        incoming_path = Path(action["incoming"])
+        destination = Path(action["destination"])
+        temporary = Path(action["temporary"])
+        temporary.unlink(missing_ok=True)
+        shutil.copy2(incoming_path, temporary)
+        temporary.replace(destination)
+        actions[index]["applied"] = True
+        journal["actions"] = actions
+        atomic_write_json(journal_path, journal)
+    journal["status"] = "complete"
+    journal["finished_at"] = utc_now()
+    atomic_write_json(journal_path, journal)
     pruned = prune_backup_runs(
         backup_dir,
         current_backup=backup_root,
@@ -485,6 +815,9 @@ def run_source_sync(
     sample_size: int | None = None,
 ) -> dict[str, Any]:
     ensure_output_dirs(config)
+    recovery = recover_incomplete_source_apply(config)
+    if recovery:
+        LOGGER.warning("Recovered interrupted source apply: %s", recovery)
     source = resolve_source_backend(config, source)
     staging_dir = staging_dir or configured_path(config, "staging_dir", "output/source_sync/latest")
     backup_dir = configured_path(config, "backup_dir", "output/source_sync/backups")
@@ -509,6 +842,7 @@ def run_source_sync(
         "apply_actions": [],
         "backup_retention": int(config.source_sync.get("backup_retention", 1)),
         "pruned_backup_directories": [],
+        "recovery": recovery,
     }
     incremental = config.incremental
     record_table = str(incremental.get("record_table", "")).strip()
@@ -523,13 +857,14 @@ def run_source_sync(
     changed_ids: set[str] = set()
     removed_ids: set[str] = set()
     invalidating_tables: set[str] = set()
+    structurally_invalid_tables: set[str] = set()
     missing_previous_snapshot = False
     for table in source_tables(config):
         name = table["name"]
         filename = table["filename"]
         primary_key = table.get("primary_key", "id")
         current_path = find_current_file(config, filename)
-        incoming_path = exported.get(filename) if exported else current_path
+        incoming_path = exported.get(filename, current_path) if source in {"mysql", "postgres"} else current_path
 
         table_report: dict[str, Any] = {
             "filename": filename,
@@ -542,29 +877,46 @@ def run_source_sync(
         if incoming_path is None or not incoming_path.exists():
             table_report.update({"status": "missing_incoming_source"})
             report["tables"][name] = table_report
+            structurally_invalid_tables.add(name)
             continue
-        incoming = read_source_csv(incoming_path, nrows=sample_size if source == "csv" else None)
-        current = read_source_csv(current_path, nrows=sample_size) if current_path and current_path.exists() else None
-        comparison, changes = compare_snapshot_changes(
-            current,
-            incoming,
-            primary_key=primary_key,
-        )
+        use_streaming_compare = source in {"mysql", "postgres"} and sample_size is None
+        current: pd.DataFrame | None = None
+        incoming: pd.DataFrame | None = None
+        if use_streaming_compare:
+            comparison, changes = compare_csv_snapshot_changes(
+                current_path,
+                incoming_path,
+                primary_key=primary_key,
+                record_key=dependent_tables.get(name),
+            )
+        else:
+            incoming = read_source_csv(incoming_path, nrows=sample_size if source == "csv" else None)
+            current = read_source_csv(current_path, nrows=sample_size) if current_path and current_path.exists() else None
+            comparison, changes = compare_snapshot_changes(
+                current,
+                incoming,
+                primary_key=primary_key,
+            )
         table_report.update(comparison)
         table_report["status"] = "ok"
         report["tables"][name] = table_report
 
-        table_changed = any(changes.values())
+        table_changed = any(
+            int(comparison.get(key) or 0)
+            for key in ("added_rows", "removed_rows", "updated_rows")
+        )
         if not table_changed:
             continue
-        if current is None:
+        if current_path is None:
             missing_previous_snapshot = True
         if (
             comparison["current_duplicate_key_rows"]
             or comparison["incoming_duplicate_key_rows"]
             or not comparison["primary_key_available"]
+            or bool(comparison.get("added_columns"))
+            or bool(comparison.get("removed_columns"))
         ):
-            invalidating_tables.add(name)
+            structurally_invalid_tables.add(name)
             continue
         if name == record_table:
             if primary_key != record_key:
@@ -575,45 +927,43 @@ def run_source_sync(
             continue
         if name in dependent_tables:
             parent_key = dependent_tables[name]
-            changed_ids.update(
-                related_record_ids(
-                    incoming,
-                    primary_key=primary_key,
-                    row_keys=changes["added"] | changes["updated"],
-                    record_key=parent_key,
+            if use_streaming_compare:
+                changed_ids.update(
+                    related_record_ids_csv(
+                        incoming_path,
+                        primary_key=primary_key,
+                        row_keys=changes["added"] | changes["updated"],
+                        record_key=parent_key,
+                    )
                 )
-            )
-            changed_ids.update(
-                related_record_ids(
-                    current,
-                    primary_key=primary_key,
-                    row_keys=changes["removed"] | changes["updated"],
-                    record_key=parent_key,
+                changed_ids.update(
+                    related_record_ids_csv(
+                        current_path,
+                        primary_key=primary_key,
+                        row_keys=changes["removed"] | changes["updated"],
+                        record_key=parent_key,
+                    )
                 )
-            )
+            else:
+                changed_ids.update(
+                    related_record_ids(
+                        incoming,
+                        primary_key=primary_key,
+                        row_keys=changes["added"] | changes["updated"],
+                        record_key=parent_key,
+                    )
+                )
+                changed_ids.update(
+                    related_record_ids(
+                        current,
+                        primary_key=primary_key,
+                        row_keys=changes["removed"] | changes["updated"],
+                        record_key=parent_key,
+                    )
+                )
             continue
         if name in full_rebuild_tables or name not in dependent_tables:
             invalidating_tables.add(name)
-
-    if apply and exported:
-        actions, pruned = backup_and_apply(
-            config,
-            exported,
-            backup_dir,
-            retention=report["backup_retention"],
-        )
-        report["apply_actions"] = actions
-        report["pruned_backup_directories"] = pruned
-        if pruned:
-            LOGGER.info(
-                "Pruned %s old source snapshot backup director%s; retaining %s.",
-                len(pruned),
-                "y" if len(pruned) == 1 else "ies",
-                report["backup_retention"],
-            )
-    elif apply and not exported:
-        report["apply_actions"] = []
-        report["apply_note"] = "No files were replaced because source=csv uses the existing local snapshots."
 
     incremental_available = bool(incremental) and source in {"mysql", "postgres"} and apply and sample_size is None
     if not incremental_available:
@@ -621,6 +971,12 @@ def run_source_sync(
         reason = (
             "Incremental detection requires profile settings, a full database refresh, "
             "--apply-source-refresh, and no --sample-size."
+        )
+    elif structurally_invalid_tables:
+        mode = "invalid"
+        reason = (
+            "Source snapshots failed structural checks: "
+            + ", ".join(sorted(structurally_invalid_tables))
         )
     elif missing_previous_snapshot:
         mode = "full"
@@ -635,6 +991,30 @@ def run_source_sync(
         mode = "no_changes"
         reason = "No source rows changed."
     changed_ids.difference_update(removed_ids)
+    record_report = report["tables"].get(record_table, {})
+    prior_record_rows = int(record_report.get("current_rows") or 0)
+    changed_fraction = (
+        (len(changed_ids) + len(removed_ids)) / prior_record_rows
+        if prior_record_rows
+        else 0.0
+    )
+    maximum_change_fraction = float(
+        config.quality.get("max_source_change_fraction", 0.50)
+    )
+    change_gate_min_rows = int(
+        config.quality.get("source_change_gate_min_rows", 1000)
+    )
+    if (
+        incremental_available
+        and mode == "incremental"
+        and prior_record_rows >= change_gate_min_rows
+        and changed_fraction > maximum_change_fraction
+    ):
+        mode = "invalid"
+        reason = (
+            f"Source change fraction {changed_fraction:.4f} exceeds configured "
+            f"maximum {maximum_change_fraction:.4f}."
+        )
     change_set_path, incremental_summary = write_incremental_change_set(
         config,
         source=source,
@@ -647,6 +1027,54 @@ def run_source_sync(
     )
     report["incremental"] = incremental_summary
     report["incremental"]["change_set_path"] = str(change_set_path)
+    report["incremental"]["changed_fraction"] = changed_fraction
+    if incremental_available:
+        pending = {
+            "run_id": uuid4().hex,
+            "company_id": config.company_id,
+            "created_at": utc_now(),
+            "applied": False,
+            "mode": mode,
+            "reason": reason,
+            "change_set_path": str(change_set_path),
+            "changed_id_count": len(changed_ids),
+            "removed_id_count": len(removed_ids),
+            "invalidating_tables": sorted(invalidating_tables),
+        }
+        atomic_write_json(pending_source_path(config), pending)
+
+    if apply and exported and mode == "invalid":
+        write_reports(config, report)
+        raise RuntimeError(reason)
+
+    if apply and exported:
+        actions, pruned = backup_and_apply(
+            config,
+            exported,
+            backup_dir,
+            retention=report["backup_retention"],
+        )
+        report["apply_actions"] = actions
+        report["pruned_backup_directories"] = pruned
+        if incremental_available:
+            pending = read_json(pending_source_path(config)) or pending
+            pending["applied"] = True
+            pending["applied_at"] = utc_now()
+            atomic_write_json(pending_source_path(config), pending)
+        source_apply_journal_path(config).unlink(missing_ok=True)
+        if pruned:
+            LOGGER.info(
+                "Pruned %s old source snapshot backup director%s; retaining %s.",
+                len(pruned),
+                "y" if len(pruned) == 1 else "ies",
+                report["backup_retention"],
+            )
+    elif apply and not exported:
+        report["apply_actions"] = []
+        report["apply_note"] = (
+            "No files were replaced because the existing local snapshots were used "
+            "or all database fingerprints were unchanged."
+        )
     write_reports(config, report)
     return report
 

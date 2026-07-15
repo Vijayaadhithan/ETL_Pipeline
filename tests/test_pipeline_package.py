@@ -23,10 +23,12 @@ from rag_ht_pipeline.config import (  # noqa: E402
     validate_company_slug,
 )
 import rag_ht_pipeline.source_sync as source_sync_module  # noqa: E402
+import rag_ht_pipeline.status_server as status_server_module  # noqa: E402
 from rag_ht_pipeline.mysql_loader import mysql_url_from_env  # noqa: E402
 from rag_ht_pipeline.mysql_source_loader import load_sources_to_mysql  # noqa: E402
 from rag_ht_pipeline.incremental import merge_parquet_delta  # noqa: E402
 from rag_ht_pipeline.pipeline import run_batch, validate_company_isolation  # noqa: E402
+from rag_ht_pipeline.operations import preflight, run_status_path  # noqa: E402
 from rag_ht_pipeline.postgres_loader import read_input  # noqa: E402
 from rag_ht_pipeline.publisher import (  # noqa: E402
     _mysql_publish,
@@ -36,11 +38,13 @@ from rag_ht_pipeline.publisher import (  # noqa: E402
     validate_publish_frame,
 )
 from rag_ht_pipeline.source_sync import (  # noqa: E402
+    compare_csv_snapshot_changes,
     compare_snapshot_changes,
     compare_snapshots,
     database_url,
     qualified_table_name,
     related_record_ids,
+    recover_incomplete_source_apply,
     resolve_source_backend,
 )
 from rag_ht_pipeline.stage3_attributes import (  # noqa: E402
@@ -554,6 +558,149 @@ def test_gainr_profile_selects_mysql_source() -> None:
     assert resolve_source_backend(config, "postgres") == "postgres"
 
 
+def test_generic_base_excludes_gainr_schema_and_legacy_alias_still_loads() -> None:
+    base_text = (PROJECT_ROOT / "configs" / "base.yaml").read_text(encoding="utf-8")
+    legacy = load_config(PROJECT_ROOT / "configs" / "pipeline.yaml")
+
+    assert "gainr" not in base_text.lower()
+    assert "ads_search_ready" not in base_text
+    assert "phpmyadmin" not in base_text.lower()
+    assert legacy.company_id == "gainr"
+    assert legacy.adapter == "gainr"
+    assert len(legacy.source_sync["tables"]) == 9
+    assert legacy.quality["max_row_drop_fraction"] == 0.10
+    assert legacy.quality["min_category_resolution_ratio"] == 0.99
+
+
+def test_recursive_config_inheritance_detects_cycles(tmp_path: Path) -> None:
+    first = tmp_path / "first.yaml"
+    second = tmp_path / "second.yaml"
+    first.write_text("extends: second.yaml\n", encoding="utf-8")
+    second.write_text("extends: first.yaml\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Circular config inheritance"):
+        load_config(first)
+
+
+def test_company_status_paths_follow_each_profile_output(tmp_path: Path) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    config = load_company_config("acme", companies_dir=companies)
+
+    assert run_status_path(config) == tmp_path / "output" / "acme" / "reports" / "run_status.json"
+    scheduler = (PROJECT_ROOT / "scripts" / "run_scheduled_etl.sh").read_text(encoding="utf-8")
+    assert 'status-path --company "$COMPANY"' in scheduler
+    assert '"$ROOT_DIR/output/reports/run_status.json"' not in scheduler
+
+
+def test_preflight_allows_same_local_database_user_with_warning(tmp_path: Path) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    config = load_company_config("acme", companies_dir=companies)
+    env_file = tmp_path / ".env.acme"
+    env_file.write_text(
+        "ACME_MYSQL_DATABASE=acme\n"
+        "ACME_MYSQL_USER=local_user\n"
+        "ACME_MYSQL_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    object.__setattr__(
+        config,
+        "source",
+        {
+            "backend": "mysql",
+            "database_env": "ACME_MYSQL_DATABASE",
+            "user_env": "ACME_MYSQL_USER",
+            "password_env": "ACME_MYSQL_PASSWORD",
+        },
+    )
+
+    result = preflight(config)
+
+    assert result["status"] == "PASS"
+    assert result["failures"] == []
+    assert any("same database user" in warning for warning in result["warnings"])
+
+
+def test_preflight_can_require_separate_production_database_users(tmp_path: Path) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    config = load_company_config("acme", companies_dir=companies)
+    env_file = tmp_path / ".env.acme"
+    env_file.write_text(
+        "ACME_MYSQL_DATABASE=acme\n"
+        "ACME_MYSQL_USER=shared_user\n"
+        "ACME_MYSQL_PASSWORD=secret\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    object.__setattr__(
+        config,
+        "source",
+        {
+            "backend": "mysql",
+            "database_env": "ACME_MYSQL_DATABASE",
+            "user_env": "ACME_MYSQL_USER",
+            "password_env": "ACME_MYSQL_PASSWORD",
+        },
+    )
+    object.__setattr__(
+        config,
+        "operations",
+        {
+            **config.operations,
+            "preflight": {
+                **config.operations.get("preflight", {}),
+                "require_separate_database_users": True,
+            },
+        },
+    )
+
+    result = preflight(config)
+
+    assert result["status"] == "FAIL"
+    assert any("same database user" in failure for failure in result["failures"])
+
+
+def test_aggregate_status_routes_are_company_isolated(tmp_path: Path, monkeypatch) -> None:
+    companies_dir = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    beta_dir = _write_flat_profile(tmp_path, "beta", tmp_path / "output" / "beta")
+    assert beta_dir == companies_dir
+    configs = {
+        slug: load_company_config(slug, companies_dir=companies_dir)
+        for slug in ("acme", "beta")
+    }
+
+    def fake_health(config: object) -> dict[str, object]:
+        return {"status": "RUNNING" if config.company_id == "beta" else "PASS", "company_id": config.company_id}
+
+    monkeypatch.setattr(status_server_module, "health", fake_health)
+    code, aggregate = status_server_module.status_route("/health", configs, aggregate=True)
+    company_code, company = status_server_module.status_route(
+        "/companies/beta/status", configs, aggregate=True
+    )
+    missing_code, _ = status_server_module.status_route(
+        "/companies/missing/health", configs, aggregate=True
+    )
+
+    assert code == 200
+    assert aggregate["status"] == "RUNNING"
+    assert aggregate["company_count"] == 2
+    assert set(aggregate["companies"]) == {"acme", "beta"}
+    assert company_code == 200
+    assert company == {"status": "RUNNING", "company_id": "beta"}
+    assert missing_code == 404
+
+
+def test_systemd_uses_one_aggregate_status_service() -> None:
+    unit = (PROJECT_ROOT / "deploy" / "systemd" / "rag-ht-status.service").read_text(
+        encoding="utf-8"
+    )
+    installer = (PROJECT_ROOT / "scripts" / "install_systemd.sh").read_text(encoding="utf-8")
+
+    assert "--all-companies" in unit
+    assert "deploy/systemd/rag-ht-status@.service" not in installer
+    assert "rag-ht-status.service" in installer
+
+
 def test_postgres_source_uses_profile_credentials_and_qualified_table(
     tmp_path: Path,
     monkeypatch,
@@ -814,6 +961,19 @@ def test_mysql_publish_uses_one_atomic_swap_statement(monkeypatch) -> None:
 def test_batch_continues_after_company_failure(tmp_path: Path, monkeypatch) -> None:
     first = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
     second = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
+    for config, name in ((first, "first"), (second, "second")):
+        root = tmp_path / "company-output" / name
+        object.__setattr__(
+            config,
+            "output",
+            OutputLayout(
+                root=root,
+                intermediate=root / "intermediate",
+                final=root / "final",
+                reports=root / "reports",
+                diagnostics=root / "diagnostics",
+            ),
+        )
     object.__setattr__(first, "company_id", "first")
     object.__setattr__(second, "company_id", "second")
     monkeypatch.chdir(tmp_path)
@@ -831,3 +991,80 @@ def test_batch_continues_after_company_failure(tmp_path: Path, monkeypatch) -> N
     assert result["companies"]["first"]["status"] == "FAIL"
     assert result["companies"]["second"]["status"] == "PASS"
     assert (tmp_path / "output" / "reports" / "company_batch_report.json").exists()
+
+
+def test_disk_backed_csv_comparison_matches_dataframe_comparison(tmp_path: Path) -> None:
+    current_path = tmp_path / "current.csv"
+    incoming_path = tmp_path / "incoming.csv"
+    current = pd.DataFrame([
+        {"id": "1", "name": "old"},
+        {"id": "2", "name": "same"},
+        {"id": "3", "name": "removed"},
+    ])
+    incoming = pd.DataFrame([
+        {"id": "1", "name": "new"},
+        {"id": "2", "name": "same"},
+        {"id": "4", "name": "added"},
+    ])
+    current.to_csv(current_path, index=False)
+    incoming.to_csv(incoming_path, index=False)
+
+    expected_report, expected_changes = compare_snapshot_changes(
+        current.astype("string"),
+        incoming.astype("string"),
+        primary_key="id",
+    )
+    report, changes = compare_csv_snapshot_changes(
+        current_path,
+        incoming_path,
+        primary_key="id",
+    )
+
+    for key in ("current_rows", "incoming_rows", "added_rows", "removed_rows", "updated_rows"):
+        assert report[key] == expected_report[key]
+    assert changes == expected_changes
+
+
+def test_interrupted_source_apply_is_rolled_back_from_journal(tmp_path: Path) -> None:
+    base = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
+    output = tmp_path / "output"
+    active = tmp_path / "active"
+    backup = output / "backups" / "run-1"
+    active.mkdir()
+    backup.mkdir(parents=True)
+    destination = active / "ads.csv"
+    backup_file = backup / "ads.csv"
+    destination.write_text("new partial data", encoding="utf-8")
+    backup_file.write_text("old complete data", encoding="utf-8")
+    config = replace(
+        base,
+        input_dir=active,
+        data_dir=active,
+        output=OutputLayout(
+            root=output,
+            intermediate=output / "intermediate",
+            final=output / "final",
+            reports=output / "reports",
+            diagnostics=output / "diagnostics",
+        ),
+    )
+    journal = output / "source_sync" / "apply_journal.json"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(
+        json.dumps({
+            "status": "applying",
+            "actions": [{
+                "destination": str(destination),
+                "backup": str(backup_file),
+                "temporary": str(active / ".ads.csv.tmp"),
+                "applied": True,
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    report = recover_incomplete_source_apply(config)
+
+    assert report["status"] == "rolled_back"
+    assert destination.read_text(encoding="utf-8") == "old complete data"
+    assert not journal.exists()

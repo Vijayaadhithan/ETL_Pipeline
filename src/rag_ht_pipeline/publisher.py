@@ -226,6 +226,8 @@ def _mysql_publish_file(
     table: str,
     staging: str,
     backup: str,
+    retain_previous: bool = False,
+    indexes: list[list[str]] | None = None,
 ) -> None:
     from sqlalchemy import inspect, text
 
@@ -254,12 +256,35 @@ def _mysql_publish_file(
     loaded = connection.execute(text(f"SELECT COUNT(*) FROM `{staging}`")).scalar_one()
     if loaded != expected_rows:
         raise RuntimeError(f"Staging row-count mismatch: expected {expected_rows}, loaded {loaded}")
+    for position, columns in enumerate(indexes or [], start=1):
+        safe_columns = [safe_identifier(str(column), "index column") for column in columns]
+        index_name = safe_identifier(f"idx_{staging[:42]}_{position}", "index name")
+        unique = "UNIQUE " if safe_columns == ["id"] else ""
+        column_sql = ", ".join(f"`{column}`" for column in safe_columns)
+        connection.execute(text(f"CREATE {unique}INDEX `{index_name}` ON `{staging}` ({column_sql})"))
     if inspect(connection).has_table(table):
-        connection.execute(text(f"RENAME TABLE `{table}` TO `{backup}`, `{staging}` TO `{table}`"))
-        try:
-            connection.execute(text(f"DROP TABLE `{backup}`"))
-        except Exception:
-            LOGGER.warning("Published %s but could not remove backup table %s", table, backup, exc_info=True)
+        if retain_previous:
+            if inspect(connection).has_table(backup):
+                retired = safe_identifier(
+                    f"{table[:45]}__retired_{uuid4().hex[:8]}",
+                    "retired table",
+                )
+                connection.execute(
+                    text(
+                        f"RENAME TABLE `{backup}` TO `{retired}`, "
+                        f"`{table}` TO `{backup}`, `{staging}` TO `{table}`"
+                    )
+                )
+                connection.execute(text(f"DROP TABLE `{retired}`"))
+            else:
+                connection.execute(text(f"RENAME TABLE `{table}` TO `{backup}`, `{staging}` TO `{table}`"))
+        else:
+            connection.execute(text(f"RENAME TABLE `{table}` TO `{backup}`, `{staging}` TO `{table}`"))
+        if not retain_previous:
+            try:
+                connection.execute(text(f"DROP TABLE `{backup}`"))
+            except Exception:
+                LOGGER.warning("Published %s but could not remove backup table %s", table, backup, exc_info=True)
     else:
         connection.execute(text(f"RENAME TABLE `{staging}` TO `{table}`"))
 
@@ -273,6 +298,8 @@ def _postgres_publish_file(
     staging: str,
     backup: str,
     schema: str,
+    retain_previous: bool = False,
+    indexes: list[list[str]] | None = None,
 ) -> None:
     from sqlalchemy import inspect, text
 
@@ -301,10 +328,19 @@ def _postgres_publish_file(
     loaded = connection.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{staging}"')).scalar_one()
     if loaded != expected_rows:
         raise RuntimeError(f"Staging row-count mismatch: expected {expected_rows}, loaded {loaded}")
+    for position, columns in enumerate(indexes or [], start=1):
+        safe_columns = [safe_identifier(str(column), "index column") for column in columns]
+        index_name = safe_identifier(f"idx_{staging[:42]}_{position}", "index name")
+        unique = "UNIQUE " if safe_columns == ["id"] else ""
+        column_sql = ", ".join(f'"{column}"' for column in safe_columns)
+        connection.execute(text(f'CREATE {unique}INDEX "{index_name}" ON "{schema}"."{staging}" ({column_sql})'))
     if inspect(connection).has_table(table, schema=schema):
+        if retain_previous:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{backup}"'))
         connection.execute(text(f'ALTER TABLE "{schema}"."{table}" RENAME TO "{backup}"'))
         connection.execute(text(f'ALTER TABLE "{schema}"."{staging}" RENAME TO "{table}"'))
-        connection.execute(text(f'DROP TABLE "{schema}"."{backup}"'))
+        if not retain_previous:
+            connection.execute(text(f'DROP TABLE "{schema}"."{backup}"'))
     else:
         connection.execute(text(f'ALTER TABLE "{schema}"."{staging}" RENAME TO "{table}"'))
 
@@ -339,7 +375,12 @@ def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[st
 
     suffix = uuid4().hex[:8]
     staging = safe_identifier(f"{table[:45]}__staging_{suffix}", "staging table")
-    backup = safe_identifier(f"{table[:46]}__backup_{suffix}", "backup table")
+    retain_previous = bool(config.destination.get("retain_previous_table", True))
+    backup = safe_identifier(
+        f"{table[:52]}__previous" if retain_previous else f"{table[:46]}__backup_{suffix}",
+        "backup table",
+    )
+    indexes = [list(item) for item in config.destination.get("indexes", [])]
     engine = create_engine(url)
     try:
         with engine.begin() as connection:
@@ -351,6 +392,8 @@ def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[st
                     table=table,
                     staging=staging,
                     backup=backup,
+                    retain_previous=retain_previous,
+                    indexes=indexes,
                 )
             else:
                 _postgres_publish_file(
@@ -361,6 +404,53 @@ def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[st
                     staging=staging,
                     backup=backup,
                     schema=schema,
+                    retain_previous=retain_previous,
+                    indexes=indexes,
+                )
+            from sqlalchemy import inspect, text
+
+            if backend == "mysql":
+                live = connection.execute(
+                    text(
+                        f"SELECT COUNT(*) AS rows, COUNT(DISTINCT `id`) AS distinct_ids, "
+                        f"SUM(CASE WHEN `company_id` <> :company_id THEN 1 ELSE 0 END) AS wrong_company "
+                        f"FROM `{table}`"
+                    ),
+                    {"company_id": config.company_id},
+                ).mappings().one()
+            else:
+                live = connection.execute(
+                    text(
+                        f'SELECT COUNT(*) AS rows, COUNT(DISTINCT "id") AS distinct_ids, '
+                        f'SUM(CASE WHEN "company_id" <> :company_id THEN 1 ELSE 0 END) AS wrong_company '
+                        f'FROM "{schema}"."{table}"'
+                    ),
+                    {"company_id": config.company_id},
+                ).mappings().one()
+            live_rows = int(live["rows"])
+            live_distinct = int(live["distinct_ids"])
+            live_wrong_company = int(live["wrong_company"] or 0)
+            if (
+                live_rows != validation["rows"]
+                or live_distinct != live_rows
+                or live_wrong_company
+            ):
+                if backend == "mysql" and retain_previous and inspect(connection).has_table(backup):
+                    failed = safe_identifier(
+                        f"{table[:46]}__failed_{uuid4().hex[:8]}",
+                        "failed publish table",
+                    )
+                    connection.execute(
+                        text(
+                            f"RENAME TABLE `{table}` TO `{failed}`, "
+                            f"`{backup}` TO `{table}`"
+                        )
+                    )
+                    connection.execute(text(f"DROP TABLE `{failed}`"))
+                raise RuntimeError(
+                    "Post-publish verification failed: "
+                    f"expected_rows={validation['rows']}, live_rows={live_rows}, "
+                    f"distinct_ids={live_distinct}, wrong_company={live_wrong_company}"
                 )
     except Exception:
         try:
@@ -374,8 +464,57 @@ def publish_company(config: PipelineConfig, *, dry_run: bool = False) -> dict[st
         raise
     report["published"] = True
     report["published_at"] = datetime.now(timezone.utc).isoformat()
+    report["previous_table"] = backup if retain_previous else ""
+    report["post_publish_verification"] = {
+        "status": "PASS",
+        "live_rows": live_rows,
+        "distinct_ids": live_distinct,
+        "wrong_company_rows": live_wrong_company,
+    }
     config.output.reports.mkdir(parents=True, exist_ok=True)
     (config.output.reports / "publish_report.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return report
+
+
+def rollback_company(config: PipelineConfig) -> dict[str, Any]:
+    table = safe_identifier(str(config.destination.get("table", "search_ready")), "destination table")
+    schema = safe_identifier(str(config.destination.get("schema", "public")), "destination schema")
+    previous = safe_identifier(f"{table[:52]}__previous", "previous table")
+    temporary = safe_identifier(f"{table[:46]}__rollback_{uuid4().hex[:8]}", "rollback table")
+    backend, url = destination_url(config)
+    try:
+        from sqlalchemy import create_engine, inspect, text
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("SQLAlchemy and the destination database driver are required for rollback.") from exc
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        if backend == "mysql":
+            if not inspect(connection).has_table(previous):
+                raise RuntimeError(f"No retained previous table exists: {previous}")
+            connection.execute(
+                text(f"RENAME TABLE `{table}` TO `{temporary}`, `{previous}` TO `{table}`, `{temporary}` TO `{previous}`")
+            )
+            rows = connection.execute(text(f"SELECT COUNT(*) FROM `{table}`")).scalar_one()
+        else:
+            if not inspect(connection).has_table(previous, schema=schema):
+                raise RuntimeError(f"No retained previous table exists: {schema}.{previous}")
+            connection.execute(text(f'ALTER TABLE "{schema}"."{table}" RENAME TO "{temporary}"'))
+            connection.execute(text(f'ALTER TABLE "{schema}"."{previous}" RENAME TO "{table}"'))
+            connection.execute(text(f'ALTER TABLE "{schema}"."{temporary}" RENAME TO "{previous}"'))
+            rows = connection.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{table}"')).scalar_one()
+    report = {
+        "company_id": config.company_id,
+        "rolled_back": True,
+        "rolled_back_at": datetime.now(timezone.utc).isoformat(),
+        "destination_table": table,
+        "previous_table": previous,
+        "live_rows": int(rows),
+    }
+    config.output.reports.mkdir(parents=True, exist_ok=True)
+    (config.output.reports / "rollback_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )

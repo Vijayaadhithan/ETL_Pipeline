@@ -68,7 +68,9 @@ def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool 
 
     columns = config.search_ready_columns
     if not columns:
-        raise RuntimeError("Missing search_ready.columns in configs/pipeline.yaml.")
+        raise RuntimeError(
+            f"Missing search_ready.columns in company config {config.config_path}."
+        )
     available_columns = set(pq.read_schema(input_path).names)
     missing = [column for column in columns if column not in available_columns]
     required_missing = sorted(REQUIRED_COLUMNS - available_columns)

@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from .. import stage1_category, stage2_location, stage3_attributes
+from .. import stage1_category, stage2_location, stage3_attributes_streaming
 from ..config import PipelineConfig
 from .base import CompanyAdapter
 
@@ -66,7 +66,7 @@ class GainrAdapter(CompanyAdapter):
                 record_ids=record_ids,
             ),
             "location": stage2_location.run(config, sample_size=sample_size, no_csv=no_csv),
-            "attributes": stage3_attributes.run(
+            "attributes": stage3_attributes_streaming.run(
                 config,
                 sample_size=sample_size,
                 strict_subcategory_consistency=strict_subcategory_consistency,
@@ -95,7 +95,7 @@ class GainrAdapter(CompanyAdapter):
         if stage == "location":
             return stage2_location.run(config, sample_size=sample_size, no_csv=no_csv)
         if stage == "attributes":
-            return stage3_attributes.run(
+            return stage3_attributes_streaming.run(
                 config,
                 sample_size=sample_size,
                 strict_subcategory_consistency=strict_subcategory_consistency,

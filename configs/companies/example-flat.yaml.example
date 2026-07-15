@@ -1,3 +1,5 @@
+extends: ../base.yaml
+
 company:
   id: acme
   adapter: flat_catalog

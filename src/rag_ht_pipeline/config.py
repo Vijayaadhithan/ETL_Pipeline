@@ -45,6 +45,8 @@ class PipelineConfig:
     incremental: dict[str, Any]
     filter_columns: list[str]
     search_ready_types: dict[str, list[str]]
+    quality: dict[str, Any]
+    operations: dict[str, Any]
     config_path: Path
 
 
@@ -78,16 +80,26 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
+def _read_merged_yaml(path: Path, *, chain: tuple[Path, ...] = ()) -> dict[str, Any]:
+    resolved = path.resolve()
+    if resolved in chain:
+        cycle = " -> ".join(str(item) for item in (*chain, resolved))
+        raise ValueError(f"Circular config inheritance detected: {cycle}")
+    raw = _read_yaml(resolved)
+    extends = raw.pop("extends", None)
+    if not extends:
+        return raw
+    base_path = Path(str(extends))
+    if not base_path.is_absolute():
+        base_path = resolved.parent / base_path
+    base = _read_merged_yaml(base_path, chain=(*chain, resolved))
+    return _deep_merge(base, raw)
+
+
 def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> PipelineConfig:
     project_root = Path.cwd()
     config_path = _path(project_root, config_path)
-    raw = _read_yaml(config_path)
-    extends = raw.pop("extends", None)
-    if extends:
-        base_path = Path(extends)
-        if not base_path.is_absolute():
-            base_path = (config_path.parent / base_path).resolve()
-        raw = _deep_merge(_read_yaml(base_path), raw)
+    raw = _read_merged_yaml(config_path)
 
     paths = raw.get("paths", {})
     company = raw.get("company", {})
@@ -153,6 +165,8 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> PipelineConfig:
             key: list(value)
             for key, value in dict(search_ready.get("types", {})).items()
         },
+        quality=dict(raw.get("quality", {})),
+        operations=dict(raw.get("operations", {})),
         config_path=config_path,
     )
 

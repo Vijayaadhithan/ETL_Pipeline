@@ -6,7 +6,6 @@ import os
 import shutil
 import stat
 import subprocess
-import sys
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path

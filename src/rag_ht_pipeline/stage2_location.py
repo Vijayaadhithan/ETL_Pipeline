@@ -11,7 +11,6 @@ import pyarrow.parquet as pq
 from .config import PipelineConfig
 from .stage1_category import NULL_VALUES, key, source_file, write_json
 
-
 BATCH_SIZE = 25_000
 LOGGER = logging.getLogger("rag_ht_pipeline.stage2_location")
 

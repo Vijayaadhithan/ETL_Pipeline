@@ -1,8 +1,8 @@
 [Unit]
-Description=Hourly RAG HT ETL pipeline for %i
+Description=Run RAG HT ETL for %i daily around 03:00 IST
 
 [Timer]
-OnCalendar=hourly
+OnCalendar=*-*-* 03:00:00 Asia/Kolkata
 Persistent=true
 RandomizedDelaySec=5m
 Unit=rag-ht-etl@%i.service

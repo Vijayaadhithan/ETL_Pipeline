@@ -254,11 +254,14 @@ It prevents overlapping runs for the same company. It is safe to use from the
 first scheduled execution because missing baselines automatically cause a full
 rebuild.
 
-Example hourly cron entry:
+Example daily cron entry for a server already configured to use IST:
 
 ```cron
-0 * * * * cd /path/to/ETL_Pipeline && ./scripts/run_scheduled_etl.sh gainr --publish >> output/reports/scheduled_gainr.log 2>&1
+0 3 * * * cd /path/to/ETL_Pipeline && ./scripts/run_scheduled_etl.sh gainr --publish >> output/reports/scheduled_gainr.log 2>&1
 ```
+
+Verify the server timezone before using this cron form. The provided systemd
+timer below is preferred because it declares `Asia/Kolkata` explicitly.
 
 Install and verify:
 
@@ -300,8 +303,9 @@ Override the installation path when needed:
 sudo RAG_HT_INSTALL_ROOT=/srv/rag-ht ./scripts/install_systemd.sh gainr
 ```
 
-The timer runs hourly with a randomized delay. Missed timer executions run after
-the server comes back online.
+The timer runs daily at 03:00 IST with up to five minutes of randomized delay.
+Missed timer executions run after the server comes back online. Re-run the
+installer after pulling this timer change so systemd receives the new schedule.
 
 ### Preflight, retry, and alerts
 
@@ -526,11 +530,23 @@ Use `configs/companies/example-flat.yaml.example` as a profile reference.
 
 ## Development Verification
 
-Run the test suite:
+Python 3.12.13 is recorded in `.python-version`; direct and transitive package
+versions are recorded in `pyproject.toml` and `uv.lock`. Install the exact
+development environment and run the same gate as CI:
 
 ```bash
-.venv/bin/python -m pytest -q
+uv lock --check
+uv sync --frozen --extra source-db --extra dev
+uv run --frozen --extra source-db --extra dev ruff check src scripts tests
+uv run --frozen --extra source-db --extra dev python scripts/check_markdown.py
+uv run --frozen --extra source-db --extra dev python -m compileall -q src scripts tests
+bash -n scripts/*.sh
+uv run --frozen --extra source-db --extra dev pytest -q
+git diff --check
 ```
+
+GitHub Actions runs this gate for every pull request and push to `main`.
+Concurrent runs for the same branch are cancelled when a newer commit arrives.
 
 Verify a complete streaming rebuild against the current baseline without loading
 both full datasets into memory:

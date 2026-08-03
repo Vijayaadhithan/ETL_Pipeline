@@ -12,7 +12,6 @@ from .config import PipelineConfig
 from .operations import atomic_write_json, read_json, utc_now
 from .stage3_attributes import clean
 
-
 LOGGER = logging.getLogger("rag_ht_pipeline.validation")
 VALIDATION_BATCH_SIZE = 25_000
 

@@ -18,7 +18,6 @@ from .credentials import resolve_env_value
 from .mysql_loader import mysql_dtype_map
 from .stage3_attributes import clean
 
-
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 CANONICAL_REQUIRED = {
     "company_id",

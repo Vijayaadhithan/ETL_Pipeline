@@ -97,7 +97,7 @@ def main() -> None:
         configs = {company: load_company_config(company, companies_dir=args.companies_dir)}
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             status_code, payload = status_route(
                 self.path,
                 configs,

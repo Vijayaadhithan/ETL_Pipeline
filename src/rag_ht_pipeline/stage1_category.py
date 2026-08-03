@@ -11,7 +11,6 @@ import pyarrow.parquet as pq
 
 from .config import PipelineConfig
 
-
 NULL_VALUES = ["", "NULL", "null", "None", "none", "NaN", "nan", "<NA>"]
 BATCH_SIZE = 25_000
 LOGGER = logging.getLogger("rag_ht_pipeline.stage1_category")

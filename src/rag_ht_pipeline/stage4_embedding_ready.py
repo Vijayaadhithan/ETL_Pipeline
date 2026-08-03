@@ -13,7 +13,6 @@ import pyarrow.parquet as pq
 from .config import PipelineConfig
 from .stage3_attributes import clean, dedupe
 
-
 LOGGER = logging.getLogger("rag_ht_pipeline.stage4_embedding_ready")
 BATCH_SIZE = 25_000
 

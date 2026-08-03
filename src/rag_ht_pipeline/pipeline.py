@@ -31,11 +31,14 @@ from .incremental import (
     missing_incremental_baselines,
     prepare_merged_artifacts,
 )
-from .publisher import credential_value, publish_company, rollback_company
-from .publisher import validate_publish_file
 from .operations import finish_run, start_run, update_run, utc_now
+from .publisher import (
+    credential_value,
+    publish_company,
+    rollback_company,
+    validate_publish_file,
+)
 from .validation import run_final_verification
-
 
 LOGGER = logging.getLogger("rag_ht_pipeline")
 SHARED_STAGE_ORDER = ["normalize", "embedding-ready", "search-ready", "validate"]

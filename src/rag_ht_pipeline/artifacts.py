@@ -5,7 +5,6 @@ from pathlib import Path
 
 from .config import PipelineConfig
 
-
 REPORT_FILES = {
     "category_join_report.json",
     "category_join_report.md",

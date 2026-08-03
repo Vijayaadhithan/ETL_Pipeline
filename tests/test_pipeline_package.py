@@ -9,28 +9,27 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
-from rag_ht_pipeline.adapters import get_adapter  # noqa: E402
-from rag_ht_pipeline.config import (  # noqa: E402
+import rag_ht_pipeline.source_sync as source_sync_module
+import rag_ht_pipeline.status_server as status_server_module
+from rag_ht_pipeline.adapters import get_adapter
+from rag_ht_pipeline.config import (
     OutputLayout,
     discover_company_profiles,
     load_company_config,
     load_config,
     validate_company_slug,
 )
-import rag_ht_pipeline.source_sync as source_sync_module  # noqa: E402
-import rag_ht_pipeline.status_server as status_server_module  # noqa: E402
-from rag_ht_pipeline.mysql_loader import mysql_url_from_env  # noqa: E402
-from rag_ht_pipeline.mysql_source_loader import load_sources_to_mysql  # noqa: E402
-from rag_ht_pipeline.incremental import merge_parquet_delta  # noqa: E402
-from rag_ht_pipeline.pipeline import run_batch, validate_company_isolation  # noqa: E402
-from rag_ht_pipeline.operations import preflight, run_status_path  # noqa: E402
-from rag_ht_pipeline.postgres_loader import read_input  # noqa: E402
-from rag_ht_pipeline.publisher import (  # noqa: E402
+from rag_ht_pipeline.incremental import merge_parquet_delta
+from rag_ht_pipeline.mysql_loader import mysql_url_from_env
+from rag_ht_pipeline.mysql_source_loader import load_sources_to_mysql
+from rag_ht_pipeline.operations import preflight, run_status_path
+from rag_ht_pipeline.pipeline import run_batch, validate_company_isolation
+from rag_ht_pipeline.postgres_loader import read_input
+from rag_ht_pipeline.publisher import (
     _live_verification_sql,
     _mysql_publish,
     _restore_previous_mysql_table,
@@ -39,26 +38,28 @@ from rag_ht_pipeline.publisher import (  # noqa: E402
     validate_publish_file,
     validate_publish_frame,
 )
-from rag_ht_pipeline.source_sync import (  # noqa: E402
+from rag_ht_pipeline.source_sync import (
     compare_csv_snapshot_changes,
     compare_snapshot_changes,
     compare_snapshots,
     database_url,
     qualified_table_name,
-    related_record_ids,
     recover_incomplete_source_apply,
+    related_record_ids,
     resolve_source_backend,
 )
-from rag_ht_pipeline.stage3_attributes import (  # noqa: E402
+from rag_ht_pipeline.stage3_attributes import (
     aggregate_group,
     aggregate_usable_rows,
     clean,
     dedupe,
 )
-from rag_ht_pipeline.stage4_embedding_ready import run as build_retrieval_content  # noqa: E402
-from rag_ht_pipeline.stage5_search_ready import run as build_search_ready  # noqa: E402
-from rag_ht_pipeline.stage5_search_ready import cast_search_ready_types  # noqa: E402
-from rag_ht_pipeline.validation import run_final_verification  # noqa: E402
+from rag_ht_pipeline.stage4_embedding_ready import (
+    run as build_retrieval_content,
+)
+from rag_ht_pipeline.stage5_search_ready import cast_search_ready_types
+from rag_ht_pipeline.stage5_search_ready import run as build_search_ready
+from rag_ht_pipeline.validation import run_final_verification
 
 
 def test_config_has_full_embedding_and_bm25_columns() -> None:

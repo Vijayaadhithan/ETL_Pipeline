@@ -13,7 +13,6 @@ import pandas as pd
 from .config import PipelineConfig
 from .stage1_category import NULL_VALUES, key, source_file, write_json
 
-
 LOGGER = logging.getLogger("rag_ht_pipeline.stage3_attributes")
 
 

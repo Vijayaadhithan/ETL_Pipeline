@@ -1,33 +1,37 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==82.0.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "rag-ht-pipeline"
 version = "0.2.0"
 description = "Isolated multi-company catalog enrichment and search-ready data pipeline"
-requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.15"
 dependencies = [
-  "pandas",
-  "pyarrow",
-  "python-dateutil",
-  "PyYAML",
+  "pandas==3.0.3",
+  "pyarrow==24.0.0",
+  "python-dateutil==2.9.0.post0",
+  "PyYAML==6.0.3",
 ]
 
 [project.optional-dependencies]
 postgres = [
-  "SQLAlchemy",
-  "psycopg[binary]",
-  "python-dotenv",
+  "SQLAlchemy==2.0.51",
+  "psycopg[binary]==3.3.4",
+  "python-dotenv==1.2.2",
 ]
 source-db = [
-  "SQLAlchemy",
-  "psycopg[binary]",
-  "PyMySQL",
-  "python-dotenv",
+  "SQLAlchemy==2.0.51",
+  "psycopg[binary]==3.3.4",
+  "PyMySQL==1.2.0",
+  "python-dotenv==1.2.2",
 ]
 dev = [
-  "pytest",
+  "pytest==9.1.1",
+  "ruff==0.16.1",
 ]
 
 [project.scripts]
@@ -41,3 +45,15 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "RUF100"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E402"]

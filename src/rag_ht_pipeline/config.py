@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Any
 
 import yaml
-
 
 DEFAULT_CONFIG_PATH = Path("configs/pipeline.yaml")
 DEFAULT_COMPANY = "gainr"

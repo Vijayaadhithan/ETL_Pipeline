@@ -19,7 +19,6 @@ from .stage3_attributes import (
     source_file,
 )
 
-
 BATCH_SIZE = 25_000
 LOGGER = logging.getLogger("rag_ht_pipeline.stage3_attributes_streaming")
 

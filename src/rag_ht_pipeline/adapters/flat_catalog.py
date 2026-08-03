@@ -9,7 +9,6 @@ from ..config import PipelineConfig
 from ..stage1_category import NULL_VALUES, source_file, write_json
 from .base import CompanyAdapter
 
-
 CORE_COLUMNS = (
     "id",
     "title",

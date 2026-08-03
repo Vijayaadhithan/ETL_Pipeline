@@ -14,7 +14,6 @@ import pyarrow.parquet as pq
 from .config import PipelineConfig
 from .stage3_attributes import clean
 
-
 LOGGER = logging.getLogger("rag_ht_pipeline.stage5_search_ready")
 BATCH_SIZE = 25_000
 

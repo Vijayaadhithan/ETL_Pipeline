@@ -104,6 +104,9 @@ bash -n scripts/setup.sh scripts/run_scheduled_etl.sh scripts/install_systemd.sh
 git diff --check
 ```
 
+CI additionally verifies the committed dependency lock, Ruff lint, and local
+Markdown links on every pull request and push to `main`.
+
 Run preflight:
 
 ```bash

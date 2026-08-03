@@ -20,7 +20,6 @@ from .credentials import resolve_env_value
 from .operations import atomic_write_json, read_json, utc_now
 from .stage1_category import NULL_VALUES
 
-
 LOGGER = logging.getLogger("rag_ht_pipeline.source_sync")
 SOURCE_EXPORT_BATCH_SIZE = 25_000
 
@@ -486,7 +485,6 @@ def export_database_tables(
             force_full = True
     candidate_fingerprints: dict[str, Any] = {}
     for table in source_tables(config):
-        db_table = table["db_table"]
         filename = table["filename"]
         qualified_table = qualified_table_name(table, source, default_schema=default_schema)
         if fingerprint_enabled:
@@ -497,7 +495,7 @@ def export_database_tables(
                 else "''"
             )
             fingerprint_query = (
-                f"SELECT COUNT(*) AS row_count, MAX({quote_identifier(primary_key := table.get('primary_key', 'id'), source)}) AS max_key, "
+                f"SELECT COUNT(*) AS row_count, MAX({quote_identifier(table.get('primary_key', 'id'), source)}) AS max_key, "
                 f"{updated_expression} AS max_updated_at FROM {qualified_table}"
             )
             with engine.connect() as connection:

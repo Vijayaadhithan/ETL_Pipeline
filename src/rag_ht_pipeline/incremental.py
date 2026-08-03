@@ -14,7 +14,6 @@ import pyarrow.parquet as pq
 from .config import OutputLayout, PipelineConfig, ensure_output_dirs
 from .stage3_attributes import clean
 
-
 MERGE_BATCH_SIZE = 25_000
 
 

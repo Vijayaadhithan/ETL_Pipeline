@@ -4,7 +4,6 @@ from .base import CompanyAdapter
 from .flat_catalog import FlatCatalogAdapter
 from .gainr import GainrAdapter
 
-
 ADAPTERS: dict[str, type[CompanyAdapter]] = {
     GainrAdapter.name: GainrAdapter,
     FlatCatalogAdapter.name: FlatCatalogAdapter,

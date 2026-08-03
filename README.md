@@ -257,7 +257,7 @@ rebuild.
 Example daily cron entry for a server already configured to use IST:
 
 ```cron
-0 3 * * * cd /path/to/ETL_Pipeline && ./scripts/run_scheduled_etl.sh gainr --publish >> output/reports/scheduled_gainr.log 2>&1
+0 1 * * * cd /path/to/ETL_Pipeline && ./scripts/run_scheduled_etl.sh gainr --publish >> output/reports/scheduled_gainr.log 2>&1
 ```
 
 Verify the server timezone before using this cron form. The provided systemd
@@ -303,7 +303,7 @@ Override the installation path when needed:
 sudo RAG_HT_INSTALL_ROOT=/srv/rag-ht ./scripts/install_systemd.sh gainr
 ```
 
-The timer runs daily at 03:00 IST with up to five minutes of randomized delay.
+The timer runs daily at 01:00 IST with up to five minutes of randomized delay.
 Missed timer executions run after the server comes back online. Re-run the
 installer after pulling this timer change so systemd receives the new schedule.
 

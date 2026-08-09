@@ -90,9 +90,20 @@ def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool 
     input_path = config.output.intermediate / f"{config.artifact_prefix}_stage_03_attributes_enriched.parquet"
     config.output.final.mkdir(parents=True, exist_ok=True)
     source = pq.ParquetFile(input_path)
-    missing = [column for column in config.embedding_source_columns if column not in source.schema.names]
-    if missing:
-        raise ValueError(f"Missing embedding source columns: {missing}")
+    missing_embedding = [
+        column
+        for column in config.embedding_source_columns
+        if column not in source.schema.names
+    ]
+    if missing_embedding:
+        raise ValueError(f"Missing embedding source columns: {missing_embedding}")
+    missing_bm25 = [
+        column
+        for column in config.bm25_source_columns
+        if column not in source.schema.names
+    ]
+    if missing_bm25:
+        raise ValueError(f"Missing BM25 source columns: {missing_bm25}")
 
     parquet = config.output.final / f"{config.artifact_prefix}_embedding_ready.parquet"
     csv = config.output.final / f"{config.artifact_prefix}_embedding_ready.csv"

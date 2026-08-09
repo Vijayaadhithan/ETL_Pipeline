@@ -226,6 +226,7 @@ bm25:
   source_columns:
     - id
     - title
+    - description
     - keywords
     - meta_keywords
     - custom_cat_value

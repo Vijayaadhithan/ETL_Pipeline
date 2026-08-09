@@ -73,7 +73,8 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert len(config.embedding_source_columns) == 23
     assert "attributes_text" in config.embedding_source_columns
     assert "attribute_values_text" in config.embedding_source_columns
-    assert len(config.bm25_source_columns) == 21
+    assert len(config.bm25_source_columns) == 22
+    assert "description" in config.bm25_source_columns
     assert len(config.search_ready_columns) == 42
     assert config.company_id == "gainr"
     assert config.adapter == "gainr"
@@ -925,6 +926,7 @@ def test_flat_catalog_adapter_emits_canonical_isolated_artifacts(
         final.loc[0, "embedding_content"]
         == "Title: Cordless Drill Description: 18V drill"
     )
+    assert final.loc[0, "bm25_content"] == "Cordless Drill 18V drill Example"
     assert len(final.loc[0, "embedding_content_hash"]) == 64
     assert len(final.loc[0, "retrieval_metadata_hash"]) == 64
     assert verification["status"] == "PASS"

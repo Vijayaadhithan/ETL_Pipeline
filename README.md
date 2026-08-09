@@ -229,6 +229,37 @@ Incremental behavior:
 - shared category, location, or attribute reference changes trigger a full
   rebuild because they may affect many records
 
+### Retrieval-content contract changes
+
+Gainr's vector and lexical text contracts intentionally overlap but are
+independently hashed:
+
+- `embedding_content` includes the normalized listing description, catalogue
+  fields, location, and attributes used for semantic retrieval;
+- `bm25_content` includes the listing ID, title, description, catalogue fields,
+  rental/location data, and attributes used for exact and rare-term recall;
+- `embedding_content_hash` changes only when vector source text changes;
+- `retrieval_metadata_hash` also covers BM25 and filter metadata.
+
+The incremental pipeline rebuilds only source records detected as new or
+changed. Therefore, changing `embedding.source_columns`,
+`bm25.source_columns`, normalization rules, or another content-building rule
+requires one full all-row rebuild even when source records themselves did not
+change:
+
+```bash
+PYTHONUNBUFFERED=1 .venv/bin/rag-ht-pipeline \
+  --company gainr \
+  --run-all \
+  --no-csv \
+  --publish
+```
+
+Do not add `--incremental` to that migration run. After its atomic publish, the
+downstream search ingestion may still reuse all vectors when
+`embedding_content_hash` stayed unchanged; it will update BM25 and filter
+metadata from the changed `retrieval_metadata_hash`.
+
 The source snapshots are still compared to detect updates and deletions.
 Publishing still loads the complete merged final artifact to preserve atomic
 table replacement.
@@ -525,6 +556,34 @@ To onboard a company:
 7. Complete a full baseline run and publish dry-run.
 8. Enable the company's timer with
    `sudo ./scripts/install_systemd.sh <slug>`.
+
+Each company can use an independent source host, source schema, destination
+host/table, adapter, content columns, output root, credentials file, schedule,
+and quality thresholds. `--company <slug>` loads only that profile. The
+all-company runner executes profiles independently, continues other companies
+after one failure, and returns a nonzero batch status if any company failed.
+Publishing uses a company-specific staging/previous/live table sequence and
+validates `company_id`, so rows are never intentionally merged across tenants.
+
+## Moving ETL to another server
+
+The pipeline is host-independent when paths and credentials are supplied by the
+company profile and environment file. On a new server:
+
+1. clone the repository and check out the reviewed revision;
+2. copy credentials through a secret channel into the profile's owner-only
+   environment file;
+3. update source/destination hostnames, ports, TLS paths, and profile-owned
+   input/output directories;
+4. run `./scripts/setup.sh <slug>`, preflight, and a small source-sync sample;
+5. run a full `--run-all --no-csv` baseline and `--publish-dry-run`;
+6. publish atomically, verify live/distinct/company row counts, and only then
+   enable the company's schedule.
+
+Active CSV snapshots and the Stage 3/final Parquet files may be transferred to
+retain incremental baselines, but a clean full baseline is also supported.
+Never transfer one company's output directory or destination table into another
+company's profile.
 
 Use `configs/companies/example-flat.yaml.example` as a profile reference.
 

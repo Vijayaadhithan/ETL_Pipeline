@@ -113,6 +113,30 @@ Run preflight:
 .venv/bin/rag-ht-ops preflight --company gainr
 ```
 
+Decide whether this is a row update or a retrieval-content contract update:
+
+- use the scheduled incremental wrapper for ordinary new, updated, or deleted
+  source records;
+- use a full all-row rebuild when code/config changes
+  `embedding.source_columns`, `bm25.source_columns`, normalization rules, or
+  any logic that constructs `embedding_content` or `bm25_content`.
+
+For a retrieval-content contract update, do not use the incremental wrapper.
+Build and atomically publish every row:
+
+```bash
+PYTHONUNBUFFERED=1 .venv/bin/rag-ht-pipeline \
+  --company gainr \
+  --run-all \
+  --no-csv \
+  --publish
+```
+
+Changing only BM25 columns should leave `embedding_content_hash` unchanged.
+The downstream backend ingestion should then report metadata-updated rows and
+zero re-embeddings. If the embedding source text/model/dimensions changed, plan
+and monitor a genuine re-embedding instead.
+
 Build and validate current source data without publishing:
 
 ```bash
@@ -427,3 +451,8 @@ git pull --ff-only
 .venv/bin/rag-ht-pipeline --company gainr --publish
 .venv/bin/rag-ht-ops status --company gainr
 ```
+
+After a retrieval-content contract change, replace the wrapper/build/publish
+sequence above with the full all-row command documented in section 4. Verify a
+known description-only term directly in `output/final/ads_search_ready.parquet`
+before starting downstream ingestion.

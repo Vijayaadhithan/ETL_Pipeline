@@ -30,6 +30,7 @@ from .incremental import (
     load_change_set,
     missing_incremental_baselines,
     prepare_merged_artifacts,
+    recover_incomplete_artifact_commit,
 )
 from .operations import finish_run, start_run, update_run, utc_now
 from .publisher import (
@@ -47,10 +48,20 @@ STAGE_CHOICES = [*SHARED_STAGE_ORDER, *LEGACY_STAGES]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the isolated multi-company catalog enrichment pipeline.")
+    parser = argparse.ArgumentParser(
+        description="Run the isolated multi-company catalog enrichment pipeline."
+    )
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--company", default=None, help=f"Company profile slug (default: {DEFAULT_COMPANY}).")
-    selection.add_argument("--all-companies", action="store_true", help="Run every configured company profile.")
+    selection.add_argument(
+        "--company",
+        default=None,
+        help=f"Company profile slug (default: {DEFAULT_COMPANY}).",
+    )
+    selection.add_argument(
+        "--all-companies",
+        action="store_true",
+        help="Run every configured company profile.",
+    )
     parser.add_argument("--companies-dir", type=Path, default=DEFAULT_COMPANIES_DIR)
     parser.add_argument(
         "--config",
@@ -58,14 +69,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Direct config path for compatibility; cannot be combined with --all-companies.",
     )
-    parser.add_argument("--run-all", action="store_true", help="Normalize, build content, finalize, and validate.")
+    parser.add_argument(
+        "--run-all",
+        action="store_true",
+        help="Normalize, build content, finalize, and validate.",
+    )
     parser.add_argument(
         "--stage",
         choices=STAGE_CHOICES,
         action="append",
         help="Run one or more specific stages. Legacy stages are supported by the Gainr adapter.",
     )
-    parser.add_argument("--sample-size", type=int, default=None, help="Optional row limit for development runs.")
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Optional row limit for development runs.",
+    )
     parser.add_argument(
         "--no-csv",
         action="store_true",
@@ -115,7 +135,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("--config cannot be combined with --company.")
     if args.incremental:
         if not args.run_all or args.stage:
-            parser.error("--incremental requires --run-all and cannot be combined with --stage.")
+            parser.error(
+                "--incremental requires --run-all and cannot be combined with --stage."
+            )
         if not args.refresh_source or not args.apply_source_refresh:
             parser.error(
                 "--incremental requires --refresh-source and --apply-source-refresh."
@@ -123,12 +145,16 @@ def parse_args() -> argparse.Namespace:
         if args.sample_size is not None:
             parser.error("--incremental cannot be combined with --sample-size.")
         if not args.no_csv:
-            parser.error("--incremental requires --no-csv to avoid stale full CSV copies.")
+            parser.error(
+                "--incremental requires --no-csv to avoid stale full CSV copies."
+            )
     return args
 
 
 def configure_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s - %(message)s"
+    )
 
 
 def write_pipeline_report(config: PipelineConfig, reports: dict[str, Any]) -> Path:
@@ -142,7 +168,9 @@ def write_pipeline_report(config: PipelineConfig, reports: dict[str, Any]) -> Pa
     }
     output_path = config.output.reports / "pipeline_run_report.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
+    )
     return output_path
 
 
@@ -215,13 +243,14 @@ def run_incremental_update(
             (
                 prepared_path
                 for prepared_path, destination in prepared
-                if destination.name
-                == f"{config.artifact_prefix}_search_ready.parquet"
+                if destination.name == f"{config.artifact_prefix}_search_ready.parquet"
             ),
             None,
         )
         if prepared_search is None:
-            raise RuntimeError("Incremental merge did not prepare a search-ready artifact.")
+            raise RuntimeError(
+                "Incremental merge did not prepare a search-ready artifact."
+            )
         reports["pre_commit_validation"] = validate_publish_file(
             config,
             prepared_search,
@@ -239,12 +268,25 @@ def run_incremental_update(
     return reports
 
 
-def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> dict[str, Any]:
+def run_company_pipeline(
+    args: argparse.Namespace, config: PipelineConfig
+) -> dict[str, Any]:
     ensure_output_dirs(config)
+    artifact_recovery = recover_incomplete_artifact_commit(config)
     adapter = get_adapter(config.adapter)
-    publish_only = (args.publish or args.publish_dry_run or args.rollback) and not args.run_all and not args.stage
-    stages = [] if publish_only else (SHARED_STAGE_ORDER if args.run_all or not args.stage else args.stage)
+    publish_only = (
+        (args.publish or args.publish_dry_run or args.rollback)
+        and not args.run_all
+        and not args.stage
+    )
+    stages = (
+        []
+        if publish_only
+        else (SHARED_STAGE_ORDER if args.run_all or not args.stage else args.stage)
+    )
     reports: dict[str, Any] = {}
+    if artifact_recovery is not None:
+        reports["artifact-recovery"] = artifact_recovery
 
     if args.rollback:
         update_run(config, stage="rollback")
@@ -253,14 +295,18 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
         return reports
 
     source_sync_report: dict[str, Any] | None = None
-    pending_source = source_sync.load_pending_source_run(config) if args.incremental else None
+    pending_source = (
+        source_sync.load_pending_source_run(config) if args.incremental else None
+    )
     if pending_source and pending_source.get("applied"):
         LOGGER.warning(
             "[%s] resuming pending source generation %s",
             config.company_id,
             pending_source.get("run_id"),
         )
-        update_run(config, stage="resume-pending-source", pending_source_run=pending_source)
+        update_run(
+            config, stage="resume-pending-source", pending_source_run=pending_source
+        )
         source_sync_report = {
             "resumed": True,
             "incremental": {
@@ -270,7 +316,9 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
         reports["source-sync-resume"] = pending_source
     elif args.refresh_source:
         update_run(config, stage="source-sync")
-        resolved_source = source_sync.resolve_source_backend(config, args.refresh_source)
+        resolved_source = source_sync.resolve_source_backend(
+            config, args.refresh_source
+        )
         LOGGER.info(
             "[%s] refreshing source snapshots from %s",
             config.company_id,
@@ -287,7 +335,9 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
 
     if args.incremental:
         if source_sync_report is None:
-            raise RuntimeError("Incremental execution requires a source refresh report.")
+            raise RuntimeError(
+                "Incremental execution requires a source refresh report."
+            )
         change_set_path = Path(
             source_sync_report.get("incremental", {}).get("change_set_path", "")
         )
@@ -367,9 +417,13 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
                 no_csv=args.no_csv,
             )
         elif stage == "validate":
-            reports[stage] = run_final_verification(config, sample_size=args.sample_size)
+            reports[stage] = run_final_verification(
+                config, sample_size=args.sample_size
+            )
             if reports[stage]["status"] != "PASS":
-                raise RuntimeError(f"Final validation failed for company {config.company_id!r}.")
+                raise RuntimeError(
+                    f"Final validation failed for company {config.company_id!r}."
+                )
         organize_stage_artifacts(config)
         LOGGER.info(
             "[%s] completed stage %s in %.2fs",
@@ -379,15 +433,25 @@ def run_company_pipeline(args: argparse.Namespace, config: PipelineConfig) -> di
         )
 
     if args.publish or args.publish_dry_run:
-        update_run(config, stage="publish-dry-run" if args.publish_dry_run else "publish")
-        validation = reports.get("validate") or run_final_verification(config, sample_size=args.sample_size)
+        update_run(
+            config, stage="publish-dry-run" if args.publish_dry_run else "publish"
+        )
+        validation = reports.get("validate") or run_final_verification(
+            config, sample_size=args.sample_size
+        )
         reports["validate"] = validation
         if validation["status"] != "PASS":
-            raise RuntimeError(f"Publishing blocked by failed validation for company {config.company_id!r}.")
-        reports["publish"] = publish_company(config, dry_run=args.publish_dry_run and not args.publish)
+            raise RuntimeError(
+                f"Publishing blocked by failed validation for company {config.company_id!r}."
+            )
+        reports["publish"] = publish_company(
+            config, dry_run=args.publish_dry_run and not args.publish
+        )
 
     if args.incremental:
-        reports["source-fingerprints-committed"] = source_sync.commit_source_fingerprints(config)
+        reports["source-fingerprints-committed"] = (
+            source_sync.commit_source_fingerprints(config)
+        )
         source_sync.clear_pending_source_run(config)
         reports["source-staging-cleanup"] = {
             "removed": source_sync.cleanup_source_staging(config),
@@ -424,7 +488,11 @@ def selected_configs(args: argparse.Namespace) -> list[PipelineConfig]:
         ]
         validate_company_isolation(configs)
         return configs
-    return [load_company_config(args.company or DEFAULT_COMPANY, companies_dir=args.companies_dir)]
+    return [
+        load_company_config(
+            args.company or DEFAULT_COMPANY, companies_dir=args.companies_dir
+        )
+    ]
 
 
 def validate_company_isolation(configs: list[PipelineConfig]) -> None:
@@ -445,7 +513,11 @@ def validate_company_isolation(configs: list[PipelineConfig]) -> None:
                 "MYSQL_DATABASE" if backend == "mysql" else "POSTGRES_DATABASE",
             )
         )
-        schema = "" if backend == "mysql" else str(config.destination.get("schema", "public"))
+        schema = (
+            ""
+            if backend == "mysql"
+            else str(config.destination.get("schema", "public"))
+        )
         destination_key = (backend, database_env, schema)
         if destination_key in destination_owners:
             raise ValueError(
@@ -460,12 +532,16 @@ def validate_resolved_destination_isolation(configs: list[PipelineConfig]) -> No
     for config in configs:
         backend = str(config.destination.get("backend", "mysql")).lower()
         if backend == "mysql":
-            host = credential_value(config, "host_env", "MYSQL_HOST", default="localhost")
+            host = credential_value(
+                config, "host_env", "MYSQL_HOST", default="localhost"
+            )
             port = credential_value(config, "port_env", "MYSQL_PORT", default="3306")
             database = credential_value(config, "database_env", "MYSQL_DATABASE")
             schema = ""
         elif backend == "postgres":
-            host = credential_value(config, "host_env", "POSTGRES_HOST", default="localhost")
+            host = credential_value(
+                config, "host_env", "POSTGRES_HOST", default="localhost"
+            )
             port = credential_value(config, "port_env", "POSTGRES_PORT", default="5432")
             database = credential_value(config, "database_env", "POSTGRES_DATABASE")
             schema = str(config.destination.get("schema", "public"))
@@ -484,7 +560,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     """Backward-compatible single-company programmatic entry point."""
     configs = selected_configs(args)
     if len(configs) != 1:
-        raise ValueError("run_pipeline supports one company; use run_batch for --all-companies.")
+        raise ValueError(
+            "run_pipeline supports one company; use run_batch for --all-companies."
+        )
     return run_company_pipeline(args, configs[0])
 
 
@@ -533,7 +611,9 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     result["finished_at"] = datetime.now(timezone.utc).isoformat()
     batch_report = Path.cwd() / "output" / "reports" / "company_batch_report.json"
     batch_report.parent.mkdir(parents=True, exist_ok=True)
-    batch_report.write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    batch_report.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
+    )
     result["batch_report"] = str(batch_report)
     return result
 

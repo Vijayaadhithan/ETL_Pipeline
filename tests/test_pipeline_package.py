@@ -23,7 +23,10 @@ from rag_ht_pipeline.config import (
     load_config,
     validate_company_slug,
 )
-from rag_ht_pipeline.incremental import merge_parquet_delta
+from rag_ht_pipeline.incremental import (
+    merge_parquet_delta,
+    recover_incomplete_artifact_commit,
+)
 from rag_ht_pipeline.mysql_loader import mysql_url_from_env
 from rag_ht_pipeline.mysql_source_loader import load_sources_to_mysql
 from rag_ht_pipeline.operations import preflight, run_status_path
@@ -57,7 +60,10 @@ from rag_ht_pipeline.stage3_attributes import (
 from rag_ht_pipeline.stage4_embedding_ready import (
     run as build_retrieval_content,
 )
-from rag_ht_pipeline.stage5_search_ready import cast_search_ready_types
+from rag_ht_pipeline.stage5_search_ready import (
+    add_retrieval_hashes,
+    cast_search_ready_types,
+)
 from rag_ht_pipeline.stage5_search_ready import run as build_search_ready
 from rag_ht_pipeline.validation import run_final_verification
 
@@ -68,7 +74,7 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "attributes_text" in config.embedding_source_columns
     assert "attribute_values_text" in config.embedding_source_columns
     assert len(config.bm25_source_columns) == 21
-    assert len(config.search_ready_columns) == 40
+    assert len(config.search_ready_columns) == 42
     assert config.company_id == "gainr"
     assert config.adapter == "gainr"
     assert "company_id" in config.search_ready_columns
@@ -77,11 +83,16 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "extras_json" in config.search_ready_columns
     assert "embedding_content" in config.search_ready_columns
     assert "bm25_content" in config.search_ready_columns
+    assert "embedding_content_hash" in config.search_ready_columns
+    assert "retrieval_metadata_hash" in config.search_ready_columns
     assert "embedding_source_columns_json" not in config.search_ready_columns
     assert "embedding_content_char_count" not in config.search_ready_columns
     assert "embedding_content_token_estimate" not in config.search_ready_columns
     assert len(config.source_sync["tables"]) == 9
-    assert {table["filename"] for table in config.source_sync["tables"]} >= {"ads.csv", "ads_attributes.csv"}
+    assert {table["filename"] for table in config.source_sync["tables"]} >= {
+        "ads.csv",
+        "ads_attributes.csv",
+    }
 
 
 def test_final_embedding_ready_file_is_readable_if_present() -> None:
@@ -112,7 +123,10 @@ def test_mysql_url_uses_env_credentials(monkeypatch) -> None:
 
     url = mysql_url_from_env()
 
-    assert url == "mysql+pymysql://user+name:pass+word@mysql.example.local:3307/rag_ht?charset=utf8mb4"
+    assert (
+        url
+        == "mysql+pymysql://user+name:pass+word@mysql.example.local:3307/rag_ht?charset=utf8mb4"
+    )
 
 
 def test_search_ready_type_casts_numeric_and_datetime_columns() -> None:
@@ -312,6 +326,46 @@ def test_incremental_parquet_merge_updates_adds_and_removes_rows(
     assert merged.dtypes.astype(str).to_dict() == baseline.dtypes.astype(str).to_dict()
 
 
+def test_interrupted_artifact_commit_restores_previous_generation(
+    tmp_path: Path,
+) -> None:
+    companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
+    config = load_company_config("acme", companies_dir=companies)
+    destination = config.output.final / "catalog_search_ready.parquet"
+    backup = tmp_path / "rollback" / destination.name
+    destination.parent.mkdir(parents=True)
+    backup.parent.mkdir(parents=True)
+    destination.write_text("partially committed", encoding="utf-8")
+    backup.write_text("previous generation", encoding="utf-8")
+    config.output.reports.mkdir(parents=True)
+    (config.output.reports / "artifact_commit_journal.json").write_text(
+        json.dumps(
+            {
+                "company_id": "acme",
+                "status": "applying",
+                "actions": [
+                    {
+                        "destination": str(destination),
+                        "backup": str(backup),
+                        "applied": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = recover_incomplete_artifact_commit(config)
+
+    assert report == {
+        "status": "rolled_back",
+        "restored": [str(destination)],
+        "removed": [],
+    }
+    assert destination.read_text(encoding="utf-8") == "previous generation"
+    assert not (config.output.reports / "artifact_commit_journal.json").exists()
+
+
 def test_source_sync_writes_exact_incremental_change_set(
     tmp_path: Path,
     monkeypatch,
@@ -466,9 +520,7 @@ def test_source_sync_writes_exact_incremental_change_set(
         apply=True,
     )
     full_change_set = json.loads(
-        Path(full_report["incremental"]["change_set_path"]).read_text(
-            encoding="utf-8"
-        )
+        Path(full_report["incremental"]["change_set_path"]).read_text(encoding="utf-8")
     )
 
     assert full_change_set["mode"] == "full"
@@ -550,13 +602,13 @@ def test_company_profile_loading_and_slug_validation(tmp_path: Path) -> None:
 
 
 def test_gainr_profile_selects_mysql_source() -> None:
-    config = load_company_config("gainr", companies_dir=PROJECT_ROOT / "configs" / "companies")
+    config = load_company_config(
+        "gainr", companies_dir=PROJECT_ROOT / "configs" / "companies"
+    )
 
     assert config.source["backend"] == "mysql"
     assert config.incremental["record_table"] == "ads"
-    assert config.incremental["dependent_tables"] == {
-        "ads_attributes": "ads_id"
-    }
+    assert config.incremental["dependent_tables"] == {"ads_attributes": "ads_id"}
     assert resolve_source_backend(config, "configured") == "mysql"
     assert resolve_source_backend(config, "postgres") == "postgres"
 
@@ -589,8 +641,13 @@ def test_company_status_paths_follow_each_profile_output(tmp_path: Path) -> None
     companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
     config = load_company_config("acme", companies_dir=companies)
 
-    assert run_status_path(config) == tmp_path / "output" / "acme" / "reports" / "run_status.json"
-    scheduler = (PROJECT_ROOT / "scripts" / "run_scheduled_etl.sh").read_text(encoding="utf-8")
+    assert (
+        run_status_path(config)
+        == tmp_path / "output" / "acme" / "reports" / "run_status.json"
+    )
+    scheduler = (PROJECT_ROOT / "scripts" / "run_scheduled_etl.sh").read_text(
+        encoding="utf-8"
+    )
     assert 'status-path --company "$COMPANY"' in scheduler
     assert '"$ROOT_DIR/output/reports/run_status.json"' not in scheduler
 
@@ -624,7 +681,9 @@ def test_preflight_allows_same_local_database_user_with_warning(tmp_path: Path) 
     assert any("same database user" in warning for warning in result["warnings"])
 
 
-def test_preflight_can_require_separate_production_database_users(tmp_path: Path) -> None:
+def test_preflight_can_require_separate_production_database_users(
+    tmp_path: Path,
+) -> None:
     companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
     config = load_company_config("acme", companies_dir=companies)
     env_file = tmp_path / ".env.acme"
@@ -663,7 +722,9 @@ def test_preflight_can_require_separate_production_database_users(tmp_path: Path
     assert any("same database user" in failure for failure in result["failures"])
 
 
-def test_aggregate_status_routes_are_company_isolated(tmp_path: Path, monkeypatch) -> None:
+def test_aggregate_status_routes_are_company_isolated(
+    tmp_path: Path, monkeypatch
+) -> None:
     companies_dir = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
     beta_dir = _write_flat_profile(tmp_path, "beta", tmp_path / "output" / "beta")
     assert beta_dir == companies_dir
@@ -673,10 +734,15 @@ def test_aggregate_status_routes_are_company_isolated(tmp_path: Path, monkeypatc
     }
 
     def fake_health(config: object) -> dict[str, object]:
-        return {"status": "RUNNING" if config.company_id == "beta" else "PASS", "company_id": config.company_id}
+        return {
+            "status": "RUNNING" if config.company_id == "beta" else "PASS",
+            "company_id": config.company_id,
+        }
 
     monkeypatch.setattr(status_server_module, "health", fake_health)
-    code, aggregate = status_server_module.status_route("/health", configs, aggregate=True)
+    code, aggregate = status_server_module.status_route(
+        "/health", configs, aggregate=True
+    )
     company_code, company = status_server_module.status_route(
         "/companies/beta/status", configs, aggregate=True
     )
@@ -697,7 +763,9 @@ def test_systemd_uses_one_aggregate_status_service() -> None:
     unit = (PROJECT_ROOT / "deploy" / "systemd" / "rag-ht-status.service").read_text(
         encoding="utf-8"
     )
-    installer = (PROJECT_ROOT / "scripts" / "install_systemd.sh").read_text(encoding="utf-8")
+    installer = (PROJECT_ROOT / "scripts" / "install_systemd.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert "--all-companies" in unit
     assert "deploy/systemd/rag-ht-status@.service" not in installer
@@ -767,36 +835,38 @@ def test_streaming_validation_detects_duplicates_across_batches(
     companies = _write_flat_profile(tmp_path, "acme", output_root)
     config = load_company_config("acme", companies_dir=companies)
     config.output.final.mkdir(parents=True)
-    pd.DataFrame(
-        [
-            {
-                "company_id": "acme",
-                "id": "P-1",
-                "title": "One",
-                "description": "",
-                "embedding_content": "One",
-                "bm25_content": "One",
-                "extras_json": "{}",
-            },
-            {
-                "company_id": "acme",
-                "id": "P-2",
-                "title": "Two",
-                "description": "",
-                "embedding_content": "Two",
-                "bm25_content": "Two",
-                "extras_json": "{}",
-            },
-            {
-                "company_id": "acme",
-                "id": "P-1",
-                "title": "Duplicate",
-                "description": "",
-                "embedding_content": "Duplicate",
-                "bm25_content": "Duplicate",
-                "extras_json": "{}",
-            },
-        ]
+    add_retrieval_hashes(
+        pd.DataFrame(
+            [
+                {
+                    "company_id": "acme",
+                    "id": "P-1",
+                    "title": "One",
+                    "description": "",
+                    "embedding_content": "One",
+                    "bm25_content": "One",
+                    "extras_json": "{}",
+                },
+                {
+                    "company_id": "acme",
+                    "id": "P-2",
+                    "title": "Two",
+                    "description": "",
+                    "embedding_content": "Two",
+                    "bm25_content": "Two",
+                    "extras_json": "{}",
+                },
+                {
+                    "company_id": "acme",
+                    "id": "P-1",
+                    "title": "Duplicate",
+                    "description": "",
+                    "embedding_content": "Duplicate",
+                    "bm25_content": "Duplicate",
+                    "extras_json": "{}",
+                },
+            ]
+        )
     ).to_parquet(
         config.output.final / "catalog_search_ready.parquet",
         index=False,
@@ -813,7 +883,9 @@ def test_streaming_validation_detects_duplicates_across_batches(
     assert report["duplicate_ad_id_rows"] == 2
 
 
-def test_flat_catalog_adapter_emits_canonical_isolated_artifacts(tmp_path: Path) -> None:
+def test_flat_catalog_adapter_emits_canonical_isolated_artifacts(
+    tmp_path: Path,
+) -> None:
     data_dir = tmp_path / "data" / "acme"
     data_dir.mkdir(parents=True)
     pd.DataFrame(
@@ -837,7 +909,9 @@ def test_flat_catalog_adapter_emits_canonical_isolated_artifacts(tmp_path: Path)
     build_retrieval_content(config, no_csv=True)
     build_search_ready(config, no_csv=True)
     verification = run_final_verification(config)
-    normalized = pd.read_parquet(output_root / "intermediate" / "catalog_stage_03_attributes_enriched.parquet")
+    normalized = pd.read_parquet(
+        output_root / "intermediate" / "catalog_stage_03_attributes_enriched.parquet"
+    )
     final = pd.read_parquet(output_root / "final" / "catalog_search_ready.parquet")
 
     assert report["normalization"]["output_rows"] == 1
@@ -847,13 +921,22 @@ def test_flat_catalog_adapter_emits_canonical_isolated_artifacts(tmp_path: Path)
     assert "source_reference" in normalized.loc[0, "extras_json"]
     assert "private_note" not in normalized.loc[0, "extras_json"]
     assert final.loc[0, "id"] == "P-1"
-    assert final.loc[0, "embedding_content"] == "Title: Cordless Drill Description: 18V drill"
+    assert (
+        final.loc[0, "embedding_content"]
+        == "Title: Cordless Drill Description: 18V drill"
+    )
+    assert len(final.loc[0, "embedding_content_hash"]) == 64
+    assert len(final.loc[0, "retrieval_metadata_hash"]) == 64
     assert verification["status"] == "PASS"
-    assert not (output_root / "intermediate" / "catalog_stage_03_attributes_enriched.csv").exists()
+    assert not (
+        output_root / "intermediate" / "catalog_stage_03_attributes_enriched.csv"
+    ).exists()
     assert not (tmp_path / "output" / "gainr").exists()
 
 
-def test_company_credentials_are_resolved_from_separate_files(tmp_path: Path, monkeypatch) -> None:
+def test_company_credentials_are_resolved_from_separate_files(
+    tmp_path: Path, monkeypatch
+) -> None:
     companies = _write_flat_profile(tmp_path, "acme", tmp_path / "output" / "acme")
     env_file = tmp_path / ".env.acme"
     env_file.write_text(
@@ -875,41 +958,48 @@ def test_publish_dry_run_validates_without_database_connection(tmp_path: Path) -
     )
     config = load_company_config("acme", companies_dir=companies)
     config.output.final.mkdir(parents=True)
-    pd.DataFrame(
-        [
-            {
-                "company_id": "acme",
-                "id": "P-1",
-                "title": "Drill",
-                "description": "18V",
-                "embedding_content": "Title: Drill",
-                "bm25_content": "Drill 18V",
-                "extras_json": "{}",
-            }
-        ]
+    add_retrieval_hashes(
+        pd.DataFrame(
+            [
+                {
+                    "company_id": "acme",
+                    "id": "P-1",
+                    "title": "Drill",
+                    "description": "18V",
+                    "embedding_content": "Title: Drill",
+                    "bm25_content": "Drill 18V",
+                    "extras_json": "{}",
+                }
+            ]
+        )
     ).to_parquet(config.output.final / "catalog_search_ready.parquet", index=False)
 
     report = publish_company(config, dry_run=True)
 
     assert report["published"] is False
     assert report["validation"]["rows"] == 1
-    assert validate_publish_file(
-        config,
-        config.output.final / "catalog_search_ready.parquet",
-    ) == report["validation"]
+    assert (
+        validate_publish_file(
+            config,
+            config.output.final / "catalog_search_ready.parquet",
+        )
+        == report["validation"]
+    )
 
-    invalid = pd.DataFrame(
-        [
-            {
-                "company_id": "another-company",
-                "id": "P-1",
-                "title": "Drill",
-                "description": "18V",
-                "embedding_content": "",
-                "bm25_content": "Drill",
-                "extras_json": "{}",
-            }
-        ]
+    invalid = add_retrieval_hashes(
+        pd.DataFrame(
+            [
+                {
+                    "company_id": "another-company",
+                    "id": "P-1",
+                    "title": "Drill",
+                    "description": "18V",
+                    "embedding_content": "",
+                    "bm25_content": "Drill",
+                    "extras_json": "{}",
+                }
+            ]
+        )
     )
     with pytest.raises(ValueError, match="Cannot publish invalid data"):
         validate_publish_frame(config, invalid)
@@ -953,7 +1043,9 @@ def test_mysql_publish_uses_one_atomic_swap_statement(monkeypatch) -> None:
         "search_ready__backup_1234",
     )
 
-    rename = [statement for statement in statements if statement.startswith("RENAME TABLE")]
+    rename = [
+        statement for statement in statements if statement.startswith("RENAME TABLE")
+    ]
     assert rename == [
         "RENAME TABLE `search_ready` TO `search_ready__backup_1234`, "
         "`search_ready__staging_1234` TO `search_ready`"
@@ -963,7 +1055,9 @@ def test_mysql_publish_uses_one_atomic_swap_statement(monkeypatch) -> None:
 
 def test_live_verification_sql_uses_mariadb_safe_row_count_alias() -> None:
     mysql = _live_verification_sql("mysql", table="search_ready", schema="public")
-    postgres = _live_verification_sql("postgres", table="search_ready", schema="catalog")
+    postgres = _live_verification_sql(
+        "postgres", table="search_ready", schema="catalog"
+    )
 
     assert "AS row_count" in mysql
     assert "AS rows" not in mysql
@@ -1018,7 +1112,9 @@ def test_batch_continues_after_company_failure(tmp_path: Path, monkeypatch) -> N
     object.__setattr__(first, "company_id", "first")
     object.__setattr__(second, "company_id", "second")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("rag_ht_pipeline.pipeline.selected_configs", lambda args: [first, second])
+    monkeypatch.setattr(
+        "rag_ht_pipeline.pipeline.selected_configs", lambda args: [first, second]
+    )
 
     def fake_run(args: Namespace, config: object) -> dict[str, object]:
         if config.company_id == "first":
@@ -1034,19 +1130,25 @@ def test_batch_continues_after_company_failure(tmp_path: Path, monkeypatch) -> N
     assert (tmp_path / "output" / "reports" / "company_batch_report.json").exists()
 
 
-def test_disk_backed_csv_comparison_matches_dataframe_comparison(tmp_path: Path) -> None:
+def test_disk_backed_csv_comparison_matches_dataframe_comparison(
+    tmp_path: Path,
+) -> None:
     current_path = tmp_path / "current.csv"
     incoming_path = tmp_path / "incoming.csv"
-    current = pd.DataFrame([
-        {"id": "1", "name": "old"},
-        {"id": "2", "name": "same"},
-        {"id": "3", "name": "removed"},
-    ])
-    incoming = pd.DataFrame([
-        {"id": "1", "name": "new"},
-        {"id": "2", "name": "same"},
-        {"id": "4", "name": "added"},
-    ])
+    current = pd.DataFrame(
+        [
+            {"id": "1", "name": "old"},
+            {"id": "2", "name": "same"},
+            {"id": "3", "name": "removed"},
+        ]
+    )
+    incoming = pd.DataFrame(
+        [
+            {"id": "1", "name": "new"},
+            {"id": "2", "name": "same"},
+            {"id": "4", "name": "added"},
+        ]
+    )
     current.to_csv(current_path, index=False)
     incoming.to_csv(incoming_path, index=False)
 
@@ -1061,7 +1163,13 @@ def test_disk_backed_csv_comparison_matches_dataframe_comparison(tmp_path: Path)
         primary_key="id",
     )
 
-    for key in ("current_rows", "incoming_rows", "added_rows", "removed_rows", "updated_rows"):
+    for key in (
+        "current_rows",
+        "incoming_rows",
+        "added_rows",
+        "removed_rows",
+        "updated_rows",
+    ):
         assert report[key] == expected_report[key]
     assert changes == expected_changes
 
@@ -1092,15 +1200,19 @@ def test_interrupted_source_apply_is_rolled_back_from_journal(tmp_path: Path) ->
     journal = output / "source_sync" / "apply_journal.json"
     journal.parent.mkdir(parents=True)
     journal.write_text(
-        json.dumps({
-            "status": "applying",
-            "actions": [{
-                "destination": str(destination),
-                "backup": str(backup_file),
-                "temporary": str(active / ".ads.csv.tmp"),
-                "applied": True,
-            }],
-        }),
+        json.dumps(
+            {
+                "status": "applying",
+                "actions": [
+                    {
+                        "destination": str(destination),
+                        "backup": str(backup_file),
+                        "temporary": str(active / ".ads.csv.tmp"),
+                        "applied": True,
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 

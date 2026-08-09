@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .config import OutputLayout, PipelineConfig, ensure_output_dirs
+from .operations import atomic_write_json, read_json, utc_now
 from .stage3_attributes import clean
 
 MERGE_BATCH_SIZE = 25_000
@@ -52,7 +53,9 @@ def required_incremental_baselines(config: PipelineConfig) -> list[Path]:
 
 
 def missing_incremental_baselines(config: PipelineConfig) -> list[Path]:
-    return [path for path in required_incremental_baselines(config) if not path.exists()]
+    return [
+        path for path in required_incremental_baselines(config) if not path.exists()
+    ]
 
 
 def _normalized_ids(series: pd.Series) -> pd.Series:
@@ -79,9 +82,13 @@ def merge_parquet_delta(
             )
     else:
         delta = pd.DataFrame(columns=schema.names)
-    delta_keys = _normalized_ids(delta["id"]) if "id" in delta else pd.Series(dtype="string")
+    delta_keys = (
+        _normalized_ids(delta["id"]) if "id" in delta else pd.Series(dtype="string")
+    )
     if delta_keys.eq("").any() or delta_keys.duplicated().any():
-        raise ValueError(f"Incremental delta contains empty or duplicate IDs: {delta_path}")
+        raise ValueError(
+            f"Incremental delta contains empty or duplicate IDs: {delta_path}"
+        )
     delta = delta.copy()
     delta.index = delta_keys
     delta_ids = set(delta.index)
@@ -121,7 +128,9 @@ def merge_parquet_delta(
             writer.write_table(table)
             output_rows += len(frame)
 
-        new_ids = [record_id for record_id in delta.index if record_id not in seen_delta]
+        new_ids = [
+            record_id for record_id in delta.index if record_id not in seen_delta
+        ]
         if new_ids:
             additions = delta.loc[new_ids, schema.names].reset_index(drop=True)
             writer.write_table(
@@ -159,15 +168,19 @@ def prepare_merged_artifacts(
     candidates = [
         (
             config.output.intermediate / f"{prefix}_stage_01_category_enriched.parquet",
-            work_config.output.intermediate / f"{prefix}_stage_01_category_enriched.parquet",
+            work_config.output.intermediate
+            / f"{prefix}_stage_01_category_enriched.parquet",
         ),
         (
             config.output.intermediate / f"{prefix}_stage_02_location_enriched.parquet",
-            work_config.output.intermediate / f"{prefix}_stage_02_location_enriched.parquet",
+            work_config.output.intermediate
+            / f"{prefix}_stage_02_location_enriched.parquet",
         ),
         (
-            config.output.intermediate / f"{prefix}_stage_03_attributes_enriched.parquet",
-            work_config.output.intermediate / f"{prefix}_stage_03_attributes_enriched.parquet",
+            config.output.intermediate
+            / f"{prefix}_stage_03_attributes_enriched.parquet",
+            work_config.output.intermediate
+            / f"{prefix}_stage_03_attributes_enriched.parquet",
         ),
         (
             config.output.final / f"{prefix}_embedding_ready.parquet",
@@ -201,9 +214,65 @@ def commit_merged_artifacts(
 ) -> None:
     search_name = f"{config.artifact_prefix}_search_ready.parquet"
     ordered = sorted(prepared, key=lambda item: item[1].name == search_name)
-    for prepared_path, destination in ordered:
-        prepared_path.replace(destination)
-        destination.with_suffix(".csv").unlink(missing_ok=True)
+    journal_path = config.output.reports / "artifact_commit_journal.json"
+    rollback_root = prepared[0][0].parents[1] / "rollback" if prepared else None
+    actions: list[dict[str, Any]] = []
+    if rollback_root is not None:
+        rollback_root.mkdir(parents=True, exist_ok=True)
+    for position, (prepared_path, destination) in enumerate(ordered):
+        backup = (
+            rollback_root / f"{position}_{destination.name}" if rollback_root else None
+        )
+        if backup is not None and destination.exists():
+            shutil.copy2(destination, backup)
+        actions.append(
+            {
+                "prepared": str(prepared_path),
+                "destination": str(destination),
+                "backup": str(backup) if backup is not None and backup.exists() else "",
+                "applied": False,
+            }
+        )
+    journal = {
+        "company_id": config.company_id,
+        "status": "applying",
+        "started_at": utc_now(),
+        "actions": actions,
+    }
+    atomic_write_json(journal_path, journal)
+    try:
+        for position, (prepared_path, destination) in enumerate(ordered):
+            prepared_path.replace(destination)
+            destination.with_suffix(".csv").unlink(missing_ok=True)
+            actions[position]["applied"] = True
+            journal["actions"] = actions
+            atomic_write_json(journal_path, journal)
+    except Exception:
+        recover_incomplete_artifact_commit(config)
+        raise
+    journal_path.unlink(missing_ok=True)
+
+
+def recover_incomplete_artifact_commit(config: PipelineConfig) -> dict[str, Any] | None:
+    journal_path = config.output.reports / "artifact_commit_journal.json"
+    journal = read_json(journal_path)
+    if not journal:
+        return None
+    restored: list[str] = []
+    removed: list[str] = []
+    for action in reversed(journal.get("actions", [])):
+        if not action.get("applied"):
+            continue
+        destination = Path(action["destination"])
+        backup_value = str(action.get("backup", ""))
+        if backup_value and Path(backup_value).exists():
+            Path(backup_value).replace(destination)
+            restored.append(str(destination))
+        elif destination.exists():
+            destination.unlink()
+            removed.append(str(destination))
+    journal_path.unlink(missing_ok=True)
+    return {"status": "rolled_back", "restored": restored, "removed": removed}
 
 
 def archive_incremental_reports(

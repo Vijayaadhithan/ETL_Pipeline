@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections import Counter
@@ -27,6 +28,10 @@ REQUIRED_COLUMNS = {
     "bm25_content",
     "extras_json",
 }
+GENERATED_COLUMNS = {
+    "embedding_content_hash",
+    "retrieval_metadata_hash",
+}
 INTEGER_COLUMNS = {
     "id",
     "type",
@@ -37,29 +42,77 @@ INTEGER_COLUMNS = {
     "city_id",
     "locality_id",
 }
-FLOAT_COLUMNS = {"rental_fee", "city_latitude", "city_longitude", "locality_latitude", "locality_longitude"}
+FLOAT_COLUMNS = {
+    "rental_fee",
+    "city_latitude",
+    "city_longitude",
+    "locality_latitude",
+    "locality_longitude",
+}
 DATETIME_COLUMNS = {"created_at", "updated_at"}
 
 
-def cast_search_ready_types(df: pd.DataFrame, config: PipelineConfig | None = None) -> pd.DataFrame:
+def cast_search_ready_types(
+    df: pd.DataFrame, config: PipelineConfig | None = None
+) -> pd.DataFrame:
     typed = df.copy()
-    integer_columns = set(config.search_ready_types.get("integer", [])) if config else INTEGER_COLUMNS
-    float_columns = set(config.search_ready_types.get("float", [])) if config else FLOAT_COLUMNS
-    datetime_columns = set(config.search_ready_types.get("datetime", [])) if config else DATETIME_COLUMNS
+    integer_columns = (
+        set(config.search_ready_types.get("integer", [])) if config else INTEGER_COLUMNS
+    )
+    float_columns = (
+        set(config.search_ready_types.get("float", [])) if config else FLOAT_COLUMNS
+    )
+    datetime_columns = (
+        set(config.search_ready_types.get("datetime", []))
+        if config
+        else DATETIME_COLUMNS
+    )
     for column in integer_columns & set(typed.columns):
         typed[column] = pd.to_numeric(typed[column], errors="coerce").astype("Int64")
     for column in float_columns & set(typed.columns):
         typed[column] = pd.to_numeric(typed[column], errors="coerce")
     for column in datetime_columns & set(typed.columns):
         typed[column] = pd.to_datetime(typed[column], errors="coerce")
-    for column in set(typed.columns) - integer_columns - float_columns - datetime_columns:
+    for column in (
+        set(typed.columns) - integer_columns - float_columns - datetime_columns
+    ):
         typed[column] = typed[column].map(clean).astype("string")
     return typed
 
 
-def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool = False) -> dict[str, Any]:
+def add_retrieval_hashes(df: pd.DataFrame) -> pd.DataFrame:
+    """Add stable change signals consumed by downstream index builders."""
+    hashed = df.copy()
+    hashed["embedding_content_hash"] = hashed["embedding_content"].map(
+        lambda value: hashlib.sha256(clean(value).encode("utf-8")).hexdigest()
+    )
+    excluded = {
+        "embedding_content",
+        "embedding_content_hash",
+        "retrieval_metadata_hash",
+    }
+    metadata_columns = sorted(set(hashed.columns) - excluded)
+
+    def row_hash(row: pd.Series) -> str:
+        payload = json.dumps(
+            {column: clean(row.get(column)) for column in metadata_columns},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    hashed["retrieval_metadata_hash"] = hashed.apply(row_hash, axis=1)
+    return hashed
+
+
+def run(
+    config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool = False
+) -> dict[str, Any]:
     started = perf_counter()
-    input_path = config.output.final / f"{config.artifact_prefix}_embedding_ready.parquet"
+    input_path = (
+        config.output.final / f"{config.artifact_prefix}_embedding_ready.parquet"
+    )
     if not input_path.exists():
         raise FileNotFoundError(f"Missing Stage 4 output: {input_path}")
 
@@ -71,7 +124,11 @@ def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool 
             f"Missing search_ready.columns in company config {config.config_path}."
         )
     available_columns = set(pq.read_schema(input_path).names)
-    missing = [column for column in columns if column not in available_columns]
+    missing = [
+        column
+        for column in columns
+        if column not in available_columns and column not in GENERATED_COLUMNS
+    ]
     required_missing = sorted(REQUIRED_COLUMNS - available_columns)
     if required_missing:
         raise ValueError(f"Missing required search-ready columns: {required_missing}")
@@ -107,13 +164,13 @@ def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool 
                 if len(batch) > remaining:
                     batch = batch.slice(0, remaining)
                 remaining -= len(batch)
-            selected = cast_search_ready_types(batch.to_pandas(), config)
+            selected = add_retrieval_hashes(
+                cast_search_ready_types(batch.to_pandas(), config)
+            )
             empty_embedding_rows += int(
                 selected["embedding_content"].map(clean).eq("").sum()
             )
-            empty_bm25_rows += int(
-                selected["bm25_content"].map(clean).eq("").sum()
-            )
+            empty_bm25_rows += int(selected["bm25_content"].map(clean).eq("").sum())
             if "id" in selected:
                 id_counts.update(
                     None
@@ -191,7 +248,10 @@ def run(config: PipelineConfig, *, sample_size: int | None = None, no_csv: bool 
         "empty_bm25_content_rows": empty_bm25_rows,
         "batch_size": BATCH_SIZE,
         "duration_seconds": round(perf_counter() - started, 2),
-        "output_files": {"parquet": str(parquet), "csv": str(csv) if not no_csv else ""},
+        "output_files": {
+            "parquet": str(parquet),
+            "csv": str(csv) if not no_csv else "",
+        },
     }
     (config.output.final / "search_ready_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False, default=str),

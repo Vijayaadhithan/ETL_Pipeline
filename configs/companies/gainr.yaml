@@ -26,6 +26,11 @@ source:
   password_env: SOURCE_MYSQL_PASSWORD
 
 source_sync:
+  # Gainr does not guarantee that every source-side update advances updated_at.
+  # Export full snapshots so in-place changes cannot be skipped by a cheap DB
+  # fingerprint; the incremental comparer still limits downstream transforms.
+  fingerprint:
+    enabled: false
   staging_dir: output/source_sync/latest
   backup_dir: output/source_sync/backups
   tables:
@@ -178,6 +183,8 @@ search_ready:
     - embedding_content
     - bm25_content
     - extras_json
+    - embedding_content_hash
+    - retrieval_metadata_hash
   filter_columns:
     - type
     - is_rent_negotiable

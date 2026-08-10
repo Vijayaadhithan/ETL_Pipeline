@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .config import PipelineConfig
-from .stage1_category import key, write_json
+from .stage1_category import active_rows, key, write_json
 from .stage3_attributes import (
     aggregate_usable_rows,
     build_catalog,
@@ -110,6 +110,7 @@ def run(
     writer: pq.ParquetWriter | None = None
     schema: pa.Schema | None = None
     rows = mapped_ads = mismatch_rows = 0
+    bridge_rows_loaded = soft_deleted_bridge_rows_filtered = 0
     csv_header = mismatch_header = True
     remaining = sample_size
     try:
@@ -123,6 +124,10 @@ def run(
             ads = batch.to_pandas().astype("string")
             selected = {int(value) for value in key(ads["id"]).dropna().tolist()}
             bridge_source = read_bridge_for_ads(bridge_path, selected)
+            bridge_rows_loaded += len(bridge_source)
+            active_bridge = active_rows(bridge_source)
+            soft_deleted_bridge_rows_filtered += len(bridge_source) - len(active_bridge)
+            bridge_source = active_bridge
             bridge = bridge_source.assign(
                 __ad=key(bridge_source["ads_id"]),
                 __attr=key(bridge_source["attribute_id"]),
@@ -188,6 +193,8 @@ def run(
         "confirmed_bridge_table": "ads_attributes.csv",
         "mapped_ads": mapped_ads,
         "schema_mismatch_rows": mismatch_rows,
+        "bridge_rows_loaded": bridge_rows_loaded,
+        "soft_deleted_bridge_rows_filtered": soft_deleted_bridge_rows_filtered,
         "batch_size": BATCH_SIZE,
         "duration_seconds": round(perf_counter() - started, 2),
         "output_files": {"enriched_csv": str(csv_path) if not no_csv else "", "enriched_parquet": str(parquet_path)},

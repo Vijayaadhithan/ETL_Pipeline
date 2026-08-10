@@ -224,6 +224,9 @@ Incremental behavior:
 - new and updated records are rebuilt
 - changes in dependent record data rebuild the affected records
 - deleted records are removed
+- records with a configured non-empty soft-delete marker are treated as
+  removals, and soft-deleted Gainr attribute links/definitions/values are
+  excluded from retrieval content
 - no changes skip the expensive transformation stages
 - missing baselines trigger a full rebuild
 - shared category, location, or attribute reference changes trigger a full

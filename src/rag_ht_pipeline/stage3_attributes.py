@@ -11,7 +11,7 @@ from typing import Any
 import pandas as pd
 
 from .config import PipelineConfig
-from .stage1_category import NULL_VALUES, key, source_file, write_json
+from .stage1_category import NULL_VALUES, active_rows, key, source_file, write_json
 
 LOGGER = logging.getLogger("rag_ht_pipeline.stage3_attributes")
 
@@ -63,8 +63,8 @@ def dedupe(values: list[str]) -> list[str]:
 def build_catalog(config: PipelineConfig) -> pd.DataFrame:
     categories = read_csv(source_file(config, "categories.csv"))
     subcategories = read_csv(source_file(config, "sub_categories.csv"))
-    attributes = read_csv(source_file(config, "attributes.csv"))
-    values = read_csv(source_file(config, "attribute_values.csv"))
+    attributes = active_rows(read_csv(source_file(config, "attributes.csv")))
+    values = active_rows(read_csv(source_file(config, "attribute_values.csv")))
 
     cats = categories.assign(__cat=key(categories["id"]))[["__cat", "id", "name"]].rename(
         columns={"id": "main_category_id", "name": "main_category_name"}
@@ -283,6 +283,9 @@ def run(
         ads_attributes = read_bridge_for_ads(bridge_path, selected_ad_ids)
     else:
         ads_attributes = read_csv(bridge_path)
+    bridge_rows_loaded = len(ads_attributes)
+    ads_attributes = active_rows(ads_attributes)
+    soft_deleted_bridge_rows_filtered = bridge_rows_loaded - len(ads_attributes)
     LOGGER.info(
         "Loaded attribute bridge rows=%s and catalog rows=%s",
         len(ads_attributes),
@@ -388,6 +391,8 @@ def run(
         "confirmed_bridge_table": "ads_attributes.csv",
         "mapped_ads": int((out["attribute_mapping_source"] == "explicit_bridge_table").sum()),
         "schema_mismatch_rows": int(len(mismatches)),
+        "bridge_rows_loaded": int(bridge_rows_loaded),
+        "soft_deleted_bridge_rows_filtered": int(soft_deleted_bridge_rows_filtered),
         "duration_seconds": round(perf_counter() - started, 2),
         "output_files": {
             "enriched_csv": str(csv_path) if not no_csv else "",

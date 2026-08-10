@@ -50,13 +50,18 @@ from rag_ht_pipeline.source_sync import (
     recover_incomplete_source_apply,
     related_record_ids,
     resolve_source_backend,
+    soft_deleted_record_ids_csv,
 )
+from rag_ht_pipeline.stage1_category import active_rows
+from rag_ht_pipeline.stage1_category import run as build_categories
 from rag_ht_pipeline.stage3_attributes import (
     aggregate_group,
     aggregate_usable_rows,
+    build_catalog,
     clean,
     dedupe,
 )
+from rag_ht_pipeline.stage3_attributes import run as build_attributes
 from rag_ht_pipeline.stage4_embedding_ready import (
     run as build_retrieval_content,
 )
@@ -217,6 +222,238 @@ def test_single_pass_attribute_aggregation_matches_legacy_grouping() -> None:
     }
 
     assert actual == expected
+
+
+def test_active_rows_keeps_null_and_blank_soft_delete_markers() -> None:
+    rows = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "deleted_at": [None, "", "   ", "2026-08-10 01:02:03"],
+        }
+    )
+
+    assert active_rows(rows)["id"].tolist() == [1, 2, 3]
+
+
+def test_category_stage_excludes_soft_deleted_ads(tmp_path: Path) -> None:
+    pd.DataFrame(
+        [
+            {"id": 1, "category_id": 2, "deleted_at": None},
+            {"id": 2, "category_id": 2, "deleted_at": "2026-08-10"},
+        ]
+    ).to_csv(tmp_path / "ads.csv", index=False)
+    pd.DataFrame([{"id": 1, "name": "Main"}]).to_csv(
+        tmp_path / "categories.csv", index=False
+    )
+    pd.DataFrame(
+        [
+            {
+                "id": 2,
+                "categoryId": 1,
+                "name": "Sub",
+                "slug": "sub",
+                "meta_title": "",
+                "meta_description": "",
+                "meta_keywords": "",
+                "status": 1,
+                "created_at": "2026-01-01",
+                "updated_at": "2026-01-01",
+                "deleted_at": None,
+            }
+        ]
+    ).to_csv(tmp_path / "sub_categories.csv", index=False)
+    categories = pd.read_csv(tmp_path / "categories.csv")
+    for column, value in {
+        "slug": "main",
+        "cat_group": "main",
+        "rental_duration": "day",
+        "meta_title": "",
+        "meta_description": "",
+        "meta_keywords": "",
+        "ad_title_label": "Title",
+        "placeholder": "",
+        "status": 1,
+        "created_at": "2026-01-01",
+        "updated_at": "2026-01-01",
+        "deleted_at": None,
+    }.items():
+        categories[column] = value
+    categories.to_csv(tmp_path / "categories.csv", index=False)
+    base = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
+    output = tmp_path / "output"
+    config = replace(
+        base,
+        project_root=tmp_path,
+        input_dir=tmp_path,
+        data_dir=tmp_path,
+        output=OutputLayout(
+            root=output,
+            intermediate=output / "intermediate",
+            final=output / "final",
+            reports=output / "reports",
+            diagnostics=output / "diagnostics",
+        ),
+    )
+    config.output.intermediate.mkdir(parents=True)
+    config.output.reports.mkdir(parents=True)
+
+    report = build_categories(config, no_csv=True)
+    result = pd.read_parquet(
+        config.output.intermediate / "ads_stage_01_category_enriched.parquet"
+    )
+
+    assert report["soft_deleted_rows_filtered"] == 1
+    assert result["id"].astype("Int64").tolist() == [1]
+
+
+def test_attribute_catalog_excludes_soft_deleted_definitions_and_values(
+    tmp_path: Path,
+) -> None:
+    pd.DataFrame([{"id": 1, "name": "Main"}]).to_csv(
+        tmp_path / "categories.csv", index=False
+    )
+    pd.DataFrame(
+        [{"id": 2, "categoryId": 1, "name": "Sub", "slug": "sub"}]
+    ).to_csv(tmp_path / "sub_categories.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "id": 10,
+                "sub_category_id": 2,
+                "name": "Active",
+                "mandatory": 0,
+                "is_title": 0,
+                "title_prefix": "",
+                "created_at": "2026-01-01",
+                "updated_at": "2026-01-01",
+                "deleted_at": None,
+            },
+            {
+                "id": 20,
+                "sub_category_id": 2,
+                "name": "Deleted",
+                "mandatory": 0,
+                "is_title": 0,
+                "title_prefix": "",
+                "created_at": "2026-01-01",
+                "updated_at": "2026-01-01",
+                "deleted_at": "2026-02-01",
+            },
+        ]
+    ).to_csv(tmp_path / "attributes.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "id": 100,
+                "attributeId": 10,
+                "value": "Keep",
+                "keywords": "keep",
+                "created_at": "2026-01-01",
+                "updated_at": "2026-01-01",
+                "deleted_at": None,
+            },
+            {
+                "id": 101,
+                "attributeId": 10,
+                "value": "Remove",
+                "keywords": "remove",
+                "created_at": "2026-01-01",
+                "updated_at": "2026-01-01",
+                "deleted_at": "2026-02-01",
+            },
+            {
+                "id": 102,
+                "attributeId": 10,
+                "value": "Deleted bridge",
+                "keywords": "remove",
+                "created_at": "2026-01-01",
+                "updated_at": "2026-01-01",
+                "deleted_at": None,
+            },
+            {
+                "id": 200,
+                "attributeId": 20,
+                "value": "Deleted attribute",
+                "keywords": "remove",
+                "created_at": "2026-01-01",
+                "updated_at": "2026-01-01",
+                "deleted_at": None,
+            },
+        ]
+    ).to_csv(tmp_path / "attribute_values.csv", index=False)
+    base = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
+    config = replace(
+        base,
+        project_root=tmp_path,
+        input_dir=tmp_path,
+        data_dir=tmp_path,
+        output=OutputLayout(
+            root=tmp_path / "output",
+            intermediate=tmp_path / "output" / "intermediate",
+            final=tmp_path / "output" / "final",
+            reports=tmp_path / "output" / "reports",
+            diagnostics=tmp_path / "output" / "diagnostics",
+        ),
+    )
+
+    catalog = build_catalog(config)
+
+    assert catalog["attribute_id"].astype("Int64").tolist() == [10, 10]
+    assert catalog["attribute_value_id"].astype("Int64").tolist() == [100, 102]
+
+    config.output.intermediate.mkdir(parents=True)
+    config.output.reports.mkdir(parents=True)
+    config.output.diagnostics.mkdir(parents=True)
+    pd.DataFrame([{"id": 1, "subcategory_id": 2}]).to_parquet(
+        config.output.intermediate / "ads_stage_02_location_enriched.parquet",
+        index=False,
+    )
+    pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "ads_id": 1,
+                "attribute_id": 10,
+                "value": 100,
+                "deleted_at": None,
+            },
+            {
+                "id": 2,
+                "ads_id": 1,
+                "attribute_id": 10,
+                "value": 102,
+                "deleted_at": "2026-02-01",
+            },
+        ]
+    ).to_csv(tmp_path / "ads_attributes.csv", index=False)
+
+    report = build_attributes(config, no_csv=True)
+    enriched = pd.read_parquet(
+        config.output.intermediate / "ads_stage_03_attributes_enriched.parquet"
+    )
+
+    assert report["soft_deleted_bridge_rows_filtered"] == 1
+    assert enriched.loc[0, "attributes_text"] == "Active: Keep."
+
+
+def test_soft_deleted_record_ids_csv_limits_results_to_candidates(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "ads.csv"
+    pd.DataFrame(
+        [
+            {"id": 1, "deleted_at": None},
+            {"id": 2, "deleted_at": "2026-08-10"},
+            {"id": 3, "deleted_at": "2026-08-10"},
+        ]
+    ).to_csv(source, index=False)
+
+    assert soft_deleted_record_ids_csv(
+        source,
+        record_key="id",
+        deleted_at_column="deleted_at",
+        candidate_ids={"1", "2"},
+    ) == {"2"}
 
 
 def test_source_sync_detects_added_removed_and_updated_rows() -> None:
@@ -528,6 +765,76 @@ def test_source_sync_writes_exact_incremental_change_set(
     assert full_change_set["invalidating_tables"] == ["categories"]
 
 
+def test_source_sync_classifies_soft_deleted_ads_as_removed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    current_dir = tmp_path / "current"
+    incoming_dir = tmp_path / "incoming"
+    output_root = tmp_path / "output"
+    current_dir.mkdir()
+    incoming_dir.mkdir()
+    pd.DataFrame([{"id": "1", "title": "live", "deleted_at": None}]).to_csv(
+        current_dir / "ads.csv", index=False
+    )
+    pd.DataFrame(
+        [{"id": "1", "title": "live", "deleted_at": "2026-08-10"}]
+    ).to_csv(incoming_dir / "ads.csv", index=False)
+    base = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
+    config = replace(
+        base,
+        input_dir=current_dir,
+        data_dir=current_dir,
+        output=OutputLayout(
+            root=output_root,
+            intermediate=output_root / "intermediate",
+            final=output_root / "final",
+            reports=output_root / "reports",
+            diagnostics=output_root / "diagnostics",
+        ),
+        source={"backend": "mysql"},
+        source_sync={
+            "staging_dir": str(incoming_dir),
+            "backup_dir": str(output_root / "backups"),
+            "tables": [
+                {
+                    "name": "ads",
+                    "db_table": "ads",
+                    "filename": "ads.csv",
+                    "primary_key": "id",
+                }
+            ],
+        },
+        incremental={
+            "record_table": "ads",
+            "record_key": "id",
+            "record_soft_delete_column": "deleted_at",
+            "dependent_tables": {},
+            "full_rebuild_tables": [],
+        },
+    )
+    monkeypatch.setattr(
+        source_sync_module,
+        "export_database_tables",
+        lambda *args, **kwargs: {"ads.csv": incoming_dir / "ads.csv"},
+    )
+
+    report = source_sync_module.run_source_sync(
+        config,
+        source="mysql",
+        apply=True,
+    )
+    change_set = json.loads(
+        Path(report["incremental"]["change_set_path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert change_set["mode"] == "incremental"
+    assert change_set["changed_ids"] == []
+    assert change_set["removed_ids"] == ["1"]
+
+
 def _write_flat_profile(tmp_path: Path, slug: str, output_root: Path) -> Path:
     companies = tmp_path / "configs" / "companies"
     companies.mkdir(parents=True, exist_ok=True)
@@ -609,6 +916,7 @@ def test_gainr_profile_selects_mysql_source() -> None:
 
     assert config.source["backend"] == "mysql"
     assert config.incremental["record_table"] == "ads"
+    assert config.incremental["record_soft_delete_column"] == "deleted_at"
     assert config.incremental["dependent_tables"] == {"ads_attributes": "ads_id"}
     assert resolve_source_backend(config, "configured") == "mysql"
     assert resolve_source_backend(config, "postgres") == "postgres"

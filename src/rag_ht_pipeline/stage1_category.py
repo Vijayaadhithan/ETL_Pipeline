@@ -24,6 +24,14 @@ def key(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype("string").str.strip(), errors="coerce").astype("Int64")
 
 
+def active_rows(frame: pd.DataFrame, column: str = "deleted_at") -> pd.DataFrame:
+    """Return rows whose soft-delete marker is NULL or blank."""
+    if column not in frame.columns:
+        return frame
+    deleted = frame[column].astype("string").fillna("").str.strip().ne("")
+    return frame.loc[~deleted].copy()
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -99,6 +107,8 @@ def run(
     writer: pq.ParquetWriter | None = None
     writer_schema: pa.Schema | None = None
     rows_in = 0
+    source_rows_read = 0
+    soft_deleted_rows_filtered = 0
     resolved_rows = 0
     csv_header = True
     remaining = sample_size
@@ -112,6 +122,10 @@ def run(
             low_memory=False,
         )
         for batch_number, ads in enumerate(reader, start=1):
+            source_rows_read += len(ads)
+            active_ads = active_rows(ads)
+            soft_deleted_rows_filtered += len(ads) - len(active_ads)
+            ads = active_ads
             if wanted is not None:
                 ads = ads[ads["id"].astype("string").str.strip().isin(wanted)]
             if remaining is not None:
@@ -164,6 +178,8 @@ def run(
     report = {
         "input_rows": rows_in,
         "output_rows": rows_in,
+        "source_rows_read": source_rows_read,
+        "soft_deleted_rows_filtered": soft_deleted_rows_filtered,
         "mapping_selected": "ads.category_id -> sub_categories.id -> categories.id",
         "resolved_rows": resolved_rows,
         "unresolved_rows": rows_in - resolved_rows,

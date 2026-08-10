@@ -76,6 +76,7 @@ source_sync:
 incremental:
   record_table: ads
   record_key: id
+  record_soft_delete_column: deleted_at
   dependent_tables:
     ads_attributes: ads_id
   full_rebuild_tables:

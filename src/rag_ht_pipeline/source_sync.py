@@ -287,6 +287,39 @@ def related_record_ids_csv(
     return values
 
 
+def soft_deleted_record_ids_csv(
+    path: Path | None,
+    *,
+    record_key: str,
+    deleted_at_column: str,
+    candidate_ids: set[str],
+) -> set[str]:
+    """Return candidate record IDs carrying a non-empty soft-delete marker."""
+    if path is None or not candidate_ids:
+        return set()
+    columns = list(pd.read_csv(path, nrows=0).columns)
+    if record_key not in columns or deleted_at_column not in columns:
+        return set()
+    deleted_ids: set[str] = set()
+    for chunk in pd.read_csv(
+        path,
+        usecols=[record_key, deleted_at_column],
+        dtype="string",
+        keep_default_na=True,
+        na_values=NULL_VALUES,
+        chunksize=SOURCE_EXPORT_BATCH_SIZE,
+        low_memory=False,
+    ):
+        ids = chunk[record_key].map(clean_key)
+        deleted = chunk[deleted_at_column].map(clean_key).ne("")
+        deleted_ids.update(
+            value
+            for value in ids.loc[deleted]
+            if value and value in candidate_ids
+        )
+    return deleted_ids
+
+
 def related_record_ids(
     frame: pd.DataFrame | None,
     *,
@@ -857,6 +890,7 @@ def run_source_sync(
     invalidating_tables: set[str] = set()
     structurally_invalid_tables: set[str] = set()
     missing_previous_snapshot = False
+    record_incoming_path: Path | None = None
     for table in source_tables(config):
         name = table["name"]
         filename = table["filename"]
@@ -877,6 +911,8 @@ def run_source_sync(
             report["tables"][name] = table_report
             structurally_invalid_tables.add(name)
             continue
+        if name == record_table:
+            record_incoming_path = incoming_path
         use_streaming_compare = source in {"mysql", "postgres"} and sample_size is None
         current: pd.DataFrame | None = None
         incoming: pd.DataFrame | None = None
@@ -962,6 +998,19 @@ def run_source_sync(
             continue
         if name in full_rebuild_tables or name not in dependent_tables:
             invalidating_tables.add(name)
+
+    soft_delete_column = str(
+        incremental.get("record_soft_delete_column", "")
+    ).strip()
+    if soft_delete_column and changed_ids:
+        soft_deleted_ids = soft_deleted_record_ids_csv(
+            record_incoming_path,
+            record_key=record_key,
+            deleted_at_column=soft_delete_column,
+            candidate_ids=changed_ids,
+        )
+        removed_ids.update(soft_deleted_ids)
+        changed_ids.difference_update(soft_deleted_ids)
 
     incremental_available = bool(incremental) and source in {"mysql", "postgres"} and apply and sample_size is None
     if not incremental_available:

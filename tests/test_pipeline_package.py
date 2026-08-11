@@ -35,6 +35,7 @@ from rag_ht_pipeline.postgres_loader import read_input
 from rag_ht_pipeline.publisher import (
     _live_verification_sql,
     _mysql_publish,
+    _mysql_upsert_sql,
     _restore_previous_mysql_table,
     credential_value,
     publish_company,
@@ -1374,6 +1375,34 @@ def test_live_verification_sql_uses_mariadb_safe_row_count_alias() -> None:
     assert "FROM `search_ready`" in mysql
     assert "AS row_count" in postgres
     assert 'FROM "catalog"."search_ready"' in postgres
+
+
+def test_mysql_no_delete_upsert_uses_only_insert_and_update() -> None:
+    statement = _mysql_upsert_sql(
+        "search_ready",
+        ["id", "title", "is_search_active"],
+    )
+
+    assert statement.startswith("INSERT INTO `search_ready`")
+    assert "ON DUPLICATE KEY UPDATE" in statement
+    assert "`title` = VALUES(`title`)" in statement
+    assert "`is_search_active` = VALUES(`is_search_active`)" in statement
+    assert "`id` = VALUES(`id`)" not in statement
+    assert not any(
+        forbidden in statement.upper()
+        for forbidden in ("DROP ", "DELETE ", "TRUNCATE ", "RENAME ")
+    )
+
+
+def test_mysql_live_verification_can_filter_active_rows() -> None:
+    statement = _live_verification_sql(
+        "mysql",
+        table="search_ready",
+        schema="public",
+        active_column="is_search_active",
+    )
+
+    assert "FROM `search_ready` WHERE `is_search_active` = 1" in statement
 
 
 def test_mysql_post_publish_verification_failure_restores_previous(monkeypatch) -> None:

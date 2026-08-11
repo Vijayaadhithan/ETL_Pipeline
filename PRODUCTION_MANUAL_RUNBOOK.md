@@ -13,7 +13,9 @@ the system-wide systemd units or create a `raght` user when sudo is unavailable.
 
 - Source refresh performs `SELECT` queries against the company database.
 - `--publish-dry-run` validates without changing the destination table.
-- `--publish` writes and atomically replaces `ads_search_ready`.
+- `--publish` writes `ads_search_ready` using the tenant's configured publish
+  strategy. Gainr uses a transactional no-delete upsert and exposes current rows
+  with `is_search_active = 1`.
 - The source and destination may be the same MySQL database and user.
 - Never start a second ETL while one is running. The scheduled wrapper also
   has a per-company overlap lock.

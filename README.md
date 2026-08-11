@@ -34,7 +34,10 @@ Operational guarantees:
 - Each company has its own profile, credentials, paths, reports, and destination.
 - Source database access is read-only.
 - Destination writes occur only with `--publish`.
-- Publishing uses a staging table and atomic promotion.
+- Publishing defaults to a staging table and atomic promotion. A MySQL tenant
+  whose writer cannot `DROP`, `DELETE`, `TRUNCATE`, or rename tables can use
+  `publish_strategy: upsert_soft_reconcile`; the stable destination table then
+  marks old rows inactive and upserts the current snapshot transactionally.
 - Failed validation prevents publishing.
 - Incremental runs process changed records and safely fall back to a full rebuild
   when shared reference data changes.
@@ -114,8 +117,10 @@ chmod 600 .env
 
 An administrator-ready account/grant template is available at
 `deploy/sql/mysql_accounts.sql.example`. Prefer a separate destination database;
-the writer needs table creation, indexing, atomic rename, and cleanup privileges
-there because publishing uses staging and retained-previous tables.
+atomic replacement needs table creation, indexing, rename, and cleanup
+privileges. When those privileges are unavailable, use
+`upsert_soft_reconcile`; downstream readers must filter the configured active
+column to `1` and table-level rollback is unavailable.
 
 Additional companies should use separate environment files and namespaced
 variables declared by their profile.

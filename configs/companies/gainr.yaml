@@ -97,9 +97,15 @@ destination:
   password_env: DEST_MYSQL_PASSWORD
   table: ads_search_ready
   schema: public
-  retain_previous_table: true
+  # The company-managed writer cannot DROP, DELETE, TRUNCATE, or RENAME.
+  # Publish into one stable table: prior rows become inactive and the current
+  # validated snapshot is upserted as active in the same transaction.
+  publish_strategy: upsert_soft_reconcile
+  active_column: is_search_active
+  retain_previous_table: false
   indexes:
     - [id]
+    - [is_search_active]
     - [main_category_id]
     - [subcategory_id]
     - [state_id]

@@ -53,7 +53,7 @@ from rag_ht_pipeline.source_sync import (
     resolve_source_backend,
     soft_deleted_record_ids_csv,
 )
-from rag_ht_pipeline.stage1_category import active_rows
+from rag_ht_pipeline.stage1_category import active_ad_rows, active_rows
 from rag_ht_pipeline.stage1_category import run as build_categories
 from rag_ht_pipeline.stage3_attributes import (
     aggregate_group,
@@ -275,6 +275,23 @@ def test_active_rows_keeps_null_and_blank_soft_delete_markers() -> None:
     assert active_rows(rows)["id"].tolist() == [1, 2, 3]
 
 
+def test_active_ad_rows_requires_explicit_true_status() -> None:
+    rows = pd.DataFrame(
+        {
+            "id": list(range(1, 10)),
+            "status": [1, "1", True, "true", "TRUE", 0, 2, None, ""],
+            "deleted_at": [None] * 8 + ["2026-08-10"],
+        }
+    )
+
+    assert active_ad_rows(rows)["id"].tolist() == [1, 2, 3, 4, 5]
+
+
+def test_active_ad_rows_rejects_missing_status_column() -> None:
+    with pytest.raises(ValueError, match="missing required status column"):
+        active_ad_rows(pd.DataFrame({"id": [1]}))
+
+
 def test_category_stage_excludes_soft_deleted_ads(tmp_path: Path) -> None:
     pd.DataFrame(
         [
@@ -293,6 +310,22 @@ def test_category_stage_excludes_soft_deleted_ads(tmp_path: Path) -> None:
                 "status": 1,
                 "category_id": 2,
                 "deleted_at": "2026-08-10",
+            },
+            {
+                "id": 3,
+                "user_id": 10,
+                "category_type": 1,
+                "status": 0,
+                "category_id": 2,
+                "deleted_at": None,
+            },
+            {
+                "id": 4,
+                "user_id": 10,
+                "category_type": 1,
+                "status": None,
+                "category_id": 2,
+                "deleted_at": None,
             },
         ]
     ).to_csv(tmp_path / "ads.csv", index=False)
@@ -368,6 +401,7 @@ def test_category_stage_excludes_soft_deleted_ads(tmp_path: Path) -> None:
     )
 
     assert report["soft_deleted_rows_filtered"] == 1
+    assert report["inactive_status_rows_filtered"] == 2
     assert result["id"].astype("Int64").tolist() == [1]
 
 

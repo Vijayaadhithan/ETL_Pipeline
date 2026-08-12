@@ -32,6 +32,22 @@ def active_rows(frame: pd.DataFrame, column: str = "deleted_at") -> pd.DataFrame
     return frame.loc[~deleted].copy()
 
 
+def active_ad_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return non-deleted ads whose source status is explicitly active."""
+    if "status" not in frame.columns:
+        raise ValueError("Gainr ads snapshot is missing required status column.")
+    non_deleted = active_rows(frame)
+    status = (
+        non_deleted["status"]
+        .astype("string")
+        .fillna("")
+        .str.strip()
+        .str.casefold()
+    )
+    numeric_one = pd.to_numeric(status, errors="coerce").eq(1)
+    return non_deleted.loc[numeric_one | status.eq("true")].copy()
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -57,11 +73,8 @@ def service_ad_counts(path: Path) -> dict[str, int]:
         chunksize=BATCH_SIZE,
         low_memory=False,
     ):
-        active = active_rows(frame)
-        service = active[
-            key(active["category_type"]).eq(2)
-            & key(active["status"]).eq(1)
-        ]
+        active = active_ad_rows(frame)
+        service = active[key(active["category_type"]).eq(2)]
         for user_id, count in service["user_id"].value_counts().items():
             normalized = clean_key(user_id)
             if normalized:
@@ -162,6 +175,7 @@ def run(
     rows_in = 0
     source_rows_read = 0
     soft_deleted_rows_filtered = 0
+    inactive_status_rows_filtered = 0
     resolved_rows = 0
     csv_header = True
     remaining = sample_size
@@ -176,8 +190,10 @@ def run(
         )
         for batch_number, ads in enumerate(reader, start=1):
             source_rows_read += len(ads)
-            active_ads = active_rows(ads)
-            soft_deleted_rows_filtered += len(ads) - len(active_ads)
+            non_deleted_ads = active_rows(ads)
+            soft_deleted_rows_filtered += len(ads) - len(non_deleted_ads)
+            active_ads = active_ad_rows(non_deleted_ads)
+            inactive_status_rows_filtered += len(non_deleted_ads) - len(active_ads)
             ads = active_ads
             if wanted is not None:
                 ads = ads[ads["id"].astype("string").str.strip().isin(wanted)]
@@ -252,6 +268,7 @@ def run(
         "output_rows": rows_in,
         "source_rows_read": source_rows_read,
         "soft_deleted_rows_filtered": soft_deleted_rows_filtered,
+        "inactive_status_rows_filtered": inactive_status_rows_filtered,
         "mapping_selected": "ads.category_id -> sub_categories.id -> categories.id",
         "resolved_rows": resolved_rows,
         "unresolved_rows": rows_in - resolved_rows,

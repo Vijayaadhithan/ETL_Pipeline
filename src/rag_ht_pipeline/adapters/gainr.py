@@ -21,6 +21,7 @@ class GainrAdapter(CompanyAdapter):
         "states.csv",
         "location.csv",
         "locations.csv",
+        "users.csv",
     )
 
     def validate_sources(self, config: PipelineConfig) -> dict[str, Any]:
@@ -35,6 +36,13 @@ class GainrAdapter(CompanyAdapter):
             "sub_categories.csv": {"id", "categoryId", "name"},
             "categories.csv": {"id", "name"},
             "ads_attributes.csv": {"ads_id", "attribute_id", "value"},
+            "users.csv": {
+                "id",
+                "prosper_id",
+                "name",
+                "photo",
+                "is_aadhaar_gst_verified",
+            },
         }
         missing: dict[str, list[str]] = {}
         for filename, columns in required_columns.items():

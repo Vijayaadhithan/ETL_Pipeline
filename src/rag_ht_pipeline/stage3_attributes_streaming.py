@@ -45,6 +45,7 @@ def _finish_frame(
         "attributes_text": "",
         "attribute_values_text": "",
         "attribute_keywords_text": "",
+        "ads_attributes_json": "[]",
     }
     out = ads.copy()
     out["__ad"] = key(out["id"])

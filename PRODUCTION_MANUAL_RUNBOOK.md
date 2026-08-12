@@ -134,6 +134,26 @@ PYTHONUNBUFFERED=1 .venv/bin/rag-ht-pipeline \
   --publish
 ```
 
+When deploying the Gainr public-card serving projection for the first time,
+apply its idempotent schema expansion before publishing. It alters only the
+ETL-owned `ads_search_ready` table:
+
+```bash
+set -a
+source .env
+set +a
+mysql --host="$DEST_MYSQL_HOST" \
+  --port="${DEST_MYSQL_PORT:-3306}" \
+  --user="$DEST_MYSQL_USER" \
+  --password="$DEST_MYSQL_PASSWORD" \
+  "$DEST_MYSQL_DATABASE" \
+  < deploy/sql/gainr_search_ready_cards.sql
+```
+
+The users snapshot intentionally projects only `id`, `prosper_id`, `name`,
+`photo`, and `is_aadhaar_gst_verified`. Do not expand that projection with
+credentials, contact details, notification tokens, device data, or credits.
+
 Changing only BM25 columns should leave `embedding_content_hash` unchanged.
 The downstream backend ingestion should then report metadata-updated rows and
 zero re-embeddings. If the embedding source text/model/dimensions changed, plan

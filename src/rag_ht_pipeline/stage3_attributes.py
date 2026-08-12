@@ -165,20 +165,26 @@ def aggregate_group(rows: pd.DataFrame) -> dict[str, Any]:
 def aggregate_usable_rows(rows: pd.DataFrame) -> list[dict[str, Any]]:
     columns = [
         "__ad",
+        "__attr",
+        "__value",
         "attribute_name",
         "attribute_value",
         "attribute_value_id",
         "attribute_value_keywords",
     ]
-    ordered = rows
-    if not rows["__ad"].is_monotonic_increasing:
-        ordered = rows.sort_values("__ad", kind="stable")
+    ordered = rows.copy()
+    for column in ("__attr", "__value"):
+        if column not in ordered:
+            ordered[column] = pd.NA
+    if not ordered["__ad"].is_monotonic_increasing:
+        ordered = ordered.sort_values("__ad", kind="stable")
 
     records: list[dict[str, Any]] = []
     current_ad: int | None = None
     by_attr: dict[str, list[str]] = defaultdict(list)
     value_ids: dict[str, list[int]] = defaultdict(list)
     keywords: list[str] = []
+    raw_attributes: list[dict[str, int | None]] = []
 
     def finish() -> None:
         if current_ad is None:
@@ -219,11 +225,18 @@ def aggregate_usable_rows(rows: pd.DataFrame) -> list[dict[str, Any]]:
                 "attribute_values_text": ". ".join(dedupe(values_flat))
                 + ("." if values_flat else ""),
                 "attribute_keywords_text": ", ".join(dedupe(keywords)),
+                "ads_attributes_json": json.dumps(
+                    raw_attributes,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             }
         )
 
     for (
         ad_id_raw,
+        attribute_id_raw,
+        raw_value_id,
         name_raw,
         value_raw,
         attribute_value_id,
@@ -238,6 +251,19 @@ def aggregate_usable_rows(rows: pd.DataFrame) -> list[dict[str, Any]]:
             by_attr = defaultdict(list)
             value_ids = defaultdict(list)
             keywords = []
+            raw_attributes = []
+        attribute_id = (
+            int(attribute_id_raw) if pd.notna(attribute_id_raw) else None
+        )
+        raw_value = int(raw_value_id) if pd.notna(raw_value_id) else None
+        if attribute_id is not None:
+            raw_attributes.append(
+                {
+                    "ads_id": ad_id,
+                    "attribute_id": attribute_id,
+                    "value": raw_value,
+                }
+            )
 
         name = clean(name_raw) or "Unknown Attribute"
         value = clean(value_raw)

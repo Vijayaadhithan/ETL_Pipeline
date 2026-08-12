@@ -45,6 +45,37 @@ def source_file(config: PipelineConfig, name: str) -> Path:
     raise FileNotFoundError(f"Missing required source file: {name}")
 
 
+def service_ad_counts(path: Path) -> dict[str, int]:
+    """Count active service advertisements by user with bounded memory."""
+    counts: dict[str, int] = {}
+    for frame in pd.read_csv(
+        path,
+        usecols=["user_id", "category_type", "status", "deleted_at"],
+        dtype="string",
+        keep_default_na=True,
+        na_values=NULL_VALUES,
+        chunksize=BATCH_SIZE,
+        low_memory=False,
+    ):
+        active = active_rows(frame)
+        service = active[
+            key(active["category_type"]).eq(2)
+            & key(active["status"]).eq(1)
+        ]
+        for user_id, count in service["user_id"].value_counts().items():
+            normalized = clean_key(user_id)
+            if normalized:
+                counts[normalized] = counts.get(normalized, 0) + int(count)
+    return counts
+
+
+def clean_key(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.casefold() in {"", "nan", "none", "null", "<na>"} else text
+
+
 def run(
     config: PipelineConfig,
     *,
@@ -55,9 +86,31 @@ def run(
     ads_path = source_file(config, "ads.csv")
     categories_path = source_file(config, "categories.csv")
     subcategories_path = source_file(config, "sub_categories.csv")
+    users_path = source_file(config, "users.csv")
 
     categories = read_csv(categories_path)
     subcategories = read_csv(subcategories_path)
+    users = active_rows(read_csv(users_path))
+    users["__user_key"] = key(users["id"])
+    users = users[
+        [
+            "__user_key",
+            "prosper_id",
+            "name",
+            "photo",
+            "is_aadhaar_gst_verified",
+        ]
+    ].rename(
+        columns={
+            "prosper_id": "user_prosper_id",
+            "name": "user_name",
+            "photo": "user_photo",
+            "is_aadhaar_gst_verified": "user_is_aadhaar_gst_verified",
+        }
+    )
+    if users["__user_key"].duplicated().any():
+        raise ValueError("Gainr users snapshot contains duplicate IDs.")
+    counts_by_user = service_ad_counts(ads_path)
 
     subs = subcategories.copy()
     subs["__subcategory_key"] = key(subs["id"])
@@ -140,13 +193,32 @@ def run(
             ads_out["__subcategory_key"] = key(ads_out["category_id"])
             enriched = ads_out.merge(subs, how="left", on="__subcategory_key", validate="m:1")
             enriched = enriched.merge(cats, how="left", on="__main_category_key", validate="m:1")
+            enriched["__user_key"] = key(enriched["user_id"])
+            enriched = enriched.merge(
+                users,
+                how="left",
+                on="__user_key",
+                validate="m:1",
+            )
+            enriched["service_ad_count"] = (
+                enriched["user_id"]
+                .map(lambda value: counts_by_user.get(clean_key(value), 0))
+                .astype("int64")
+            )
             enriched["category_join_status"] = enriched["subcategory_id"].notna().map(
                 {True: "resolved_via_subcategory", False: "unresolved_category_id"}
             )
             enriched.loc[key(enriched["raw_category_id"]).isna(), "category_join_status"] = "missing_category_id"
             enriched["category_join_mapping_used"] = "ads.category_id -> sub_categories.id -> categories.id"
             enriched["category_join_confidence"] = enriched["subcategory_id"].notna().astype(float)
-            enriched = enriched.drop(columns=["__subcategory_key", "__main_category_key"], errors="ignore")
+            enriched = enriched.drop(
+                columns=[
+                    "__subcategory_key",
+                    "__main_category_key",
+                    "__user_key",
+                ],
+                errors="ignore",
+            )
             table = pa.Table.from_pandas(enriched, preserve_index=False)
             if writer is None:
                 writer_schema = table.schema

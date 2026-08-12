@@ -72,11 +72,26 @@ source_sync:
       db_table: locations
       filename: locations.csv
       primary_key: id
+    - name: users
+      db_table: users
+      filename: users.csv
+      primary_key: id
+      # Export only the public card projection. Passwords, contact details,
+      # tokens, device data, credits, and account metadata never enter ETL.
+      columns:
+        - id
+        - prosper_id
+        - name
+        - photo
+        - is_aadhaar_gst_verified
 
 incremental:
   record_table: ads
   record_key: id
   record_soft_delete_column: deleted_at
+  # Card-level service counts depend on every ad owned by a user. A changed ad
+  # can therefore affect sibling cards, so prefer a correct bounded full build.
+  record_changes_require_full: true
   dependent_tables:
     ads_attributes: ads_id
   full_rebuild_tables:
@@ -87,6 +102,7 @@ incremental:
     - states
     - location
     - locations
+    - users
 
 destination:
   backend: mysql
@@ -112,6 +128,9 @@ destination:
     - [city_id]
     - [locality_id]
     - [rental_fee]
+    - [is_search_active, updated_at, id]
+    - [is_search_active, city_id, type, updated_at, id]
+    - [is_search_active, city_id, subcategory_id, type, id]
 
 # Legacy loader settings retained only for Gainr-specific utility commands.
 mysql:
@@ -140,12 +159,22 @@ search_ready:
       - state_id
       - city_id
       - locality_id
+      - user_id
+      - category_type
+      - parent_id
+      - category_id
+      - total_favorite
+      - total_like
+      - users_rating_count
+      - service_ad_count
+      - user_is_aadhaar_gst_verified
     float:
       - rental_fee
       - city_latitude
       - city_longitude
       - locality_latitude
       - locality_longitude
+      - rating_avg
     datetime:
       - created_at
       - updated_at
@@ -159,6 +188,22 @@ search_ready:
     - rental_fee
     - is_rent_negotiable
     - status
+    - user_id
+    - category_type
+    - parent_id
+    - slug
+    - category_id
+    - photos
+    - total_favorite
+    - total_like
+    - users_rating_count
+    - rating_avg
+    - service_ad_count
+    - user_prosper_id
+    - user_name
+    - user_photo
+    - user_is_aadhaar_gst_verified
+    - ads_attributes_json
     - created_at
     - updated_at
     - main_category_id

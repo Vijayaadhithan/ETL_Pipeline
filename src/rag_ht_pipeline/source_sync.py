@@ -336,7 +336,7 @@ def related_record_ids(
     return {value for value in values if value}
 
 
-def source_tables(config: PipelineConfig) -> list[dict[str, str]]:
+def source_tables(config: PipelineConfig) -> list[dict[str, Any]]:
     tables = config.source_sync.get("tables", [])
     if not tables:
         raise RuntimeError(
@@ -467,7 +467,7 @@ def quote_identifier(identifier: str, source: str) -> str:
 
 
 def qualified_table_name(
-    table: dict[str, str],
+    table: dict[str, Any],
     source: str,
     *,
     default_schema: str | None = None,
@@ -548,7 +548,21 @@ def export_database_tables(
             ):
                 LOGGER.info("Skipping unchanged table %s using DB fingerprint", qualified_table)
                 continue
-        query = f"SELECT * FROM {qualified_table}{limit_clause}"
+        configured_columns = table.get("columns")
+        if configured_columns:
+            selected_columns = [str(column) for column in configured_columns]
+            primary_key = str(table.get("primary_key", "id"))
+            if primary_key not in selected_columns:
+                raise ValueError(
+                    f"Source projection for {qualified_table} must include "
+                    f"primary key {primary_key!r}."
+                )
+            projection = ", ".join(
+                quote_identifier(column, source) for column in selected_columns
+            )
+        else:
+            projection = "*"
+        query = f"SELECT {projection} FROM {qualified_table}{limit_clause}"
         LOGGER.info("Exporting %s to %s", qualified_table, filename)
         path = staging_dir / filename
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
@@ -576,7 +590,7 @@ def export_database_tables(
             )
         if header:
             pd.read_sql_query(
-                f"SELECT * FROM {qualified_table} WHERE 1=0",
+                f"SELECT {projection} FROM {qualified_table} WHERE 1=0",
                 engine,
             ).to_csv(temporary, index=False)
         temporary.replace(path)
@@ -885,6 +899,9 @@ def run_source_sync(
     full_rebuild_tables = {
         str(table) for table in incremental.get("full_rebuild_tables", [])
     }
+    record_changes_require_full = bool(
+        incremental.get("record_changes_require_full", False)
+    )
     changed_ids: set[str] = set()
     removed_ids: set[str] = set()
     invalidating_tables: set[str] = set()
@@ -958,6 +975,8 @@ def run_source_sync(
                 continue
             changed_ids.update(changes["added"] | changes["updated"])
             removed_ids.update(changes["removed"])
+            if record_changes_require_full:
+                invalidating_tables.add(name)
             continue
         if name in dependent_tables:
             parent_key = dependent_tables[name]

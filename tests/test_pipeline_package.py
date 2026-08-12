@@ -81,7 +81,7 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "attribute_values_text" in config.embedding_source_columns
     assert len(config.bm25_source_columns) == 22
     assert "description" in config.bm25_source_columns
-    assert len(config.search_ready_columns) == 42
+    assert len(config.search_ready_columns) == 58
     assert config.company_id == "gainr"
     assert config.adapter == "gainr"
     assert "company_id" in config.search_ready_columns
@@ -95,11 +95,28 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "embedding_source_columns_json" not in config.search_ready_columns
     assert "embedding_content_char_count" not in config.search_ready_columns
     assert "embedding_content_token_estimate" not in config.search_ready_columns
-    assert len(config.source_sync["tables"]) == 9
+    assert len(config.source_sync["tables"]) == 10
     assert {table["filename"] for table in config.source_sync["tables"]} >= {
         "ads.csv",
         "ads_attributes.csv",
     }
+    users = next(
+        table for table in config.source_sync["tables"] if table["name"] == "users"
+    )
+    assert users["columns"] == [
+        "id",
+        "prosper_id",
+        "name",
+        "photo",
+        "is_aadhaar_gst_verified",
+    ]
+    assert not {
+        "password",
+        "email",
+        "phone",
+        "fcm_token",
+        "last_device_details",
+    } & set(users["columns"])
 
 
 def test_final_embedding_ready_file_is_readable_if_present() -> None:
@@ -217,12 +234,34 @@ def test_single_pass_attribute_aggregation_matches_legacy_grouping() -> None:
         record["__ad"]: {
             key: value
             for key, value in record.items()
-            if key not in {"__ad", "__mapped"}
+            if key not in {"__ad", "__mapped", "ads_attributes_json"}
         }
         for record in aggregate_usable_rows(rows)
     }
 
     assert actual == expected
+
+
+def test_single_pass_attribute_aggregation_emits_public_card_triples() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "__ad": 2,
+                "__attr": 494,
+                "__value": 4897,
+                "attribute_name": "Vehicle",
+                "attribute_value": "Car",
+                "attribute_value_id": 4897,
+                "attribute_value_keywords": "car",
+            }
+        ]
+    )
+
+    record = aggregate_usable_rows(rows)[0]
+
+    assert json.loads(record["ads_attributes_json"]) == [
+        {"ads_id": 2, "attribute_id": 494, "value": 4897}
+    ]
 
 
 def test_active_rows_keeps_null_and_blank_soft_delete_markers() -> None:
@@ -239,8 +278,22 @@ def test_active_rows_keeps_null_and_blank_soft_delete_markers() -> None:
 def test_category_stage_excludes_soft_deleted_ads(tmp_path: Path) -> None:
     pd.DataFrame(
         [
-            {"id": 1, "category_id": 2, "deleted_at": None},
-            {"id": 2, "category_id": 2, "deleted_at": "2026-08-10"},
+            {
+                "id": 1,
+                "user_id": 10,
+                "category_type": 1,
+                "status": 1,
+                "category_id": 2,
+                "deleted_at": None,
+            },
+            {
+                "id": 2,
+                "user_id": 10,
+                "category_type": 1,
+                "status": 1,
+                "category_id": 2,
+                "deleted_at": "2026-08-10",
+            },
         ]
     ).to_csv(tmp_path / "ads.csv", index=False)
     pd.DataFrame([{"id": 1, "name": "Main"}]).to_csv(
@@ -280,6 +333,17 @@ def test_category_stage_excludes_soft_deleted_ads(tmp_path: Path) -> None:
     }.items():
         categories[column] = value
     categories.to_csv(tmp_path / "categories.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "id": 10,
+                "prosper_id": "AA0010",
+                "name": "Public User",
+                "photo": None,
+                "is_aadhaar_gst_verified": 0,
+            }
+        ]
+    ).to_csv(tmp_path / "users.csv", index=False)
     base = load_config(PROJECT_ROOT / "configs/pipeline.yaml")
     output = tmp_path / "output"
     config = replace(
@@ -932,7 +996,7 @@ def test_generic_base_excludes_gainr_schema_and_legacy_alias_still_loads() -> No
     assert "phpmyadmin" not in base_text.lower()
     assert legacy.company_id == "gainr"
     assert legacy.adapter == "gainr"
-    assert len(legacy.source_sync["tables"]) == 9
+    assert len(legacy.source_sync["tables"]) == 10
     assert legacy.quality["max_row_drop_fraction"] == 0.10
     assert legacy.quality["min_category_resolution_ratio"] == 0.99
 

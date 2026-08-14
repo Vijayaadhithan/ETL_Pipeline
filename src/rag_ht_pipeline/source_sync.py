@@ -952,7 +952,18 @@ def run_source_sync(
         table_report["status"] = "ok"
         report["tables"][name] = table_report
 
-        table_changed = any(
+        added_columns = set(comparison.get("added_columns") or [])
+        removed_columns = set(comparison.get("removed_columns") or [])
+        allowed_added_columns = {
+            str(column) for column in table.get("allowed_added_columns", [])
+        }
+        accepted_added_columns = added_columns & allowed_added_columns
+        unexpected_added_columns = added_columns - allowed_added_columns
+        if accepted_added_columns:
+            table_report["accepted_added_columns"] = sorted(
+                accepted_added_columns
+            )
+        table_changed = bool(added_columns or removed_columns) or any(
             int(comparison.get(key) or 0)
             for key in ("added_rows", "removed_rows", "updated_rows")
         )
@@ -964,8 +975,8 @@ def run_source_sync(
             comparison["current_duplicate_key_rows"]
             or comparison["incoming_duplicate_key_rows"]
             or not comparison["primary_key_available"]
-            or bool(comparison.get("added_columns"))
-            or bool(comparison.get("removed_columns"))
+            or bool(unexpected_added_columns)
+            or bool(removed_columns)
         ):
             structurally_invalid_tables.add(name)
             continue

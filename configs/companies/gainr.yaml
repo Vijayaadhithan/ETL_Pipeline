@@ -85,6 +85,8 @@ source_sync:
         - photo
         - is_aadhaar_gst_verified
         - gender
+      allowed_added_columns:
+        - gender
 
 incremental:
   record_table: ads

@@ -867,6 +867,62 @@ def test_source_sync_writes_exact_incremental_change_set(
     assert full_change_set["mode"] == "full"
     assert full_change_set["invalidating_tables"] == ["categories"]
 
+    pd.DataFrame([{"id": "7", "verified": 1}]).to_csv(
+        current_dir / "users.csv",
+        index=False,
+    )
+    pd.DataFrame([{"id": "7", "verified": 1, "gender": 2}]).to_csv(
+        incoming_dir / "users.csv",
+        index=False,
+    )
+    config_with_allowed_addition = replace(
+        config,
+        source_sync={
+            **config.source_sync,
+            "tables": [
+                *config.source_sync["tables"],
+                {
+                    "name": "users",
+                    "db_table": "users",
+                    "filename": "users.csv",
+                    "primary_key": "id",
+                    "allowed_added_columns": ["gender"],
+                },
+            ],
+        },
+        incremental={
+            **config.incremental,
+            "full_rebuild_tables": ["users"],
+        },
+    )
+    monkeypatch.setattr(
+        source_sync_module,
+        "export_database_tables",
+        lambda *args, **kwargs: {
+            "ads.csv": incoming_dir / "ads.csv",
+            "ads_attributes.csv": incoming_dir / "ads_attributes.csv",
+            "users.csv": incoming_dir / "users.csv",
+        },
+    )
+
+    addition_report = source_sync_module.run_source_sync(
+        config_with_allowed_addition,
+        source="mysql",
+        apply=True,
+    )
+    addition_change_set = json.loads(
+        Path(addition_report["incremental"]["change_set_path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert addition_report["tables"]["users"]["accepted_added_columns"] == [
+        "gender"
+    ]
+    assert addition_change_set["mode"] == "full"
+    assert addition_change_set["invalidating_tables"] == ["users"]
+    assert pd.read_csv(current_dir / "users.csv")["gender"].tolist() == [2]
+
 
 def test_source_sync_classifies_soft_deleted_ads_as_removed(
     tmp_path: Path,

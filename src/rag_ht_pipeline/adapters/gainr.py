@@ -42,6 +42,7 @@ class GainrAdapter(CompanyAdapter):
                 "name",
                 "photo",
                 "is_aadhaar_gst_verified",
+                "gender",
             },
         }
         missing: dict[str, list[str]] = {}

@@ -84,6 +84,7 @@ source_sync:
         - name
         - photo
         - is_aadhaar_gst_verified
+        - gender
 
 incremental:
   record_table: ads
@@ -168,6 +169,7 @@ search_ready:
       - users_rating_count
       - service_ad_count
       - user_is_aadhaar_gst_verified
+      - user_gender
     float:
       - rental_fee
       - city_latitude
@@ -203,6 +205,7 @@ search_ready:
     - user_name
     - user_photo
     - user_is_aadhaar_gst_verified
+    - user_gender
     - ads_attributes_json
     - created_at
     - updated_at
@@ -246,6 +249,7 @@ search_ready:
     - state_id
     - city_id
     - locality_id
+    - user_gender
     - rental_fee
 
 embedding:

@@ -151,8 +151,10 @@ mysql --host="$DEST_MYSQL_HOST" \
 ```
 
 The users snapshot intentionally projects only `id`, `prosper_id`, `name`,
-`photo`, and `is_aadhaar_gst_verified`. Do not expand that projection with
-credentials, contact details, notification tokens, device data, or credits.
+`photo`, `is_aadhaar_gst_verified`, and `gender`. The gender values retain the
+Gainr mapping: `1` male, `2` female, and `3` trans. Do not expand that
+projection with credentials, contact details, notification tokens, device data,
+or credits.
 
 Changing only BM25 columns should leave `embedding_content_hash` unchanged.
 The downstream backend ingestion should then report metadata-updated rows and

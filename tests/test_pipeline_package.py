@@ -81,7 +81,7 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "attribute_values_text" in config.embedding_source_columns
     assert len(config.bm25_source_columns) == 22
     assert "description" in config.bm25_source_columns
-    assert len(config.search_ready_columns) == 58
+    assert len(config.search_ready_columns) == 59
     assert config.company_id == "gainr"
     assert config.adapter == "gainr"
     assert "company_id" in config.search_ready_columns
@@ -92,6 +92,7 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
     assert "bm25_content" in config.search_ready_columns
     assert "embedding_content_hash" in config.search_ready_columns
     assert "retrieval_metadata_hash" in config.search_ready_columns
+    assert "user_gender" in config.filter_columns
     assert "embedding_source_columns_json" not in config.search_ready_columns
     assert "embedding_content_char_count" not in config.search_ready_columns
     assert "embedding_content_token_estimate" not in config.search_ready_columns
@@ -109,6 +110,7 @@ def test_config_has_full_embedding_and_bm25_columns() -> None:
         "name",
         "photo",
         "is_aadhaar_gst_verified",
+        "gender",
     ]
     assert not {
         "password",
@@ -374,6 +376,7 @@ def test_category_stage_excludes_soft_deleted_ads(tmp_path: Path) -> None:
                 "name": "Public User",
                 "photo": None,
                 "is_aadhaar_gst_verified": 0,
+                "gender": 2,
             }
         ]
     ).to_csv(tmp_path / "users.csv", index=False)
@@ -403,6 +406,7 @@ def test_category_stage_excludes_soft_deleted_ads(tmp_path: Path) -> None:
     assert report["soft_deleted_rows_filtered"] == 1
     assert report["inactive_status_rows_filtered"] == 2
     assert result["id"].astype("Int64").tolist() == [1]
+    assert result["user_gender"].astype("Int64").tolist() == [2]
 
 
 def test_attribute_catalog_excludes_soft_deleted_definitions_and_values(

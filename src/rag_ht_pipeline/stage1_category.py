@@ -112,6 +112,7 @@ def run(
             "name",
             "photo",
             "is_aadhaar_gst_verified",
+            "gender",
         ]
     ].rename(
         columns={
@@ -119,6 +120,7 @@ def run(
             "name": "user_name",
             "photo": "user_photo",
             "is_aadhaar_gst_verified": "user_is_aadhaar_gst_verified",
+            "gender": "user_gender",
         }
     )
     if users["__user_key"].duplicated().any():
